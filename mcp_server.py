@@ -286,17 +286,14 @@ def qqq_hedge_signal(
     """
     import pandas as pd
 
-    from lib.data import load_ohlcv_yfinance
+    from lib.data import load_ohlcv_alphavantage
     from lib.qqq_hedge import QQQHedgeSignal, compute_hedge_indicators
 
     try:
-        ohlcv = load_ohlcv_yfinance(["QQQ"], start="2019-01-01")
-        if ohlcv is None:
-            from lib.data import load_ohlcv_alphavantage
-            ohlcv = load_ohlcv_alphavantage(["QQQ"], start="2019-01-01")
+        ohlcv = load_ohlcv_alphavantage(["QQQ"], start="2019-01-01")
 
         if ohlcv is None:
-            return {"error": "Could not load QQQ data from any source"}
+            return {"error": "Could not load QQQ data from Alpha Vantage"}
 
         close = ohlcv["close"]["QQQ"]
         indicators = compute_hedge_indicators(close)
@@ -372,18 +369,14 @@ def qqq_hedge_backtest(
         dd_tier_2: Moderate drawdown threshold (default -0.07)
         dd_tier_3: Severe drawdown threshold (default -0.12)
     """
-    from lib.data import load_ohlcv_yfinance
+    from lib.data import load_ohlcv_alphavantage
     from lib.qqq_hedge import HedgeConfig, QQQHedgeSignal
 
     try:
-        ohlcv = load_ohlcv_yfinance(["QQQ"], start=start, end=end)
-        if ohlcv is None:
-            from lib.data import load_ohlcv_alphavantage
-
-            ohlcv = load_ohlcv_alphavantage(["QQQ"], start=start, end=end)
+        ohlcv = load_ohlcv_alphavantage(["QQQ"], start=start, end=end)
 
         if ohlcv is None:
-            return {"error": "Could not load QQQ data from any source"}
+            return {"error": "Could not load QQQ data from Alpha Vantage"}
 
         close = ohlcv["close"]["QQQ"]
         returns = ohlcv["returns"]["QQQ"]

@@ -243,7 +243,7 @@ class TestQQQHedgeSignal:
     def test_latest(self):
         from mcp_server import qqq_hedge_signal
         mock = self._mock_ohlcv()
-        with patch("lib.data.load_ohlcv_yfinance", return_value=mock):
+        with patch("lib.data.load_ohlcv_alphavantage", return_value=mock):
             result = qqq_hedge_signal()
         assert "error" not in result
         assert "position" in result
@@ -253,7 +253,7 @@ class TestQQQHedgeSignal:
     def test_date_range(self):
         from mcp_server import qqq_hedge_signal
         mock = self._mock_ohlcv()
-        with patch("lib.data.load_ohlcv_yfinance", return_value=mock):
+        with patch("lib.data.load_ohlcv_alphavantage", return_value=mock):
             result = qqq_hedge_signal(from_date="2020-03-01", to_date="2020-03-31")
         assert "error" not in result
         assert "daily" in result
@@ -267,7 +267,7 @@ class TestQQQHedgeSignal:
     def test_date_range_empty(self):
         from mcp_server import qqq_hedge_signal
         mock = self._mock_ohlcv()
-        with patch("lib.data.load_ohlcv_yfinance", return_value=mock):
+        with patch("lib.data.load_ohlcv_alphavantage", return_value=mock):
             result = qqq_hedge_signal(from_date="2030-01-01", to_date="2030-01-31")
         assert "error" in result
 
@@ -289,7 +289,7 @@ class TestQQQHedgeBacktest:
             "returns": pd.DataFrame({"QQQ": returns}),
         }
 
-        with patch("lib.data.load_ohlcv_yfinance", return_value=mock_ohlcv):
+        with patch("lib.data.load_ohlcv_alphavantage", return_value=mock_ohlcv):
             result = qqq_hedge_backtest()
 
         assert "error" not in result
