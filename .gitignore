@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Environment
+.env
+.env.*
+
+# Virtual environments
+.venv/
+venv/
+
+# Output artifacts
+output/
+*.csv
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/

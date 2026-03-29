@@ -1,0 +1,23 @@
+# Core scientific
+numpy>=1.24,<2.0
+pandas>=2.0
+scipy>=1.10
+
+# MCP server
+mcp>=1.0
+
+# Data sources
+requests>=2.28
+yfinance>=0.2.18
+
+# LLM backends
+openai>=1.0
+anthropic>=0.40
+python-dotenv>=1.0
+
+# Factor aggregation (optional)
+lightgbm>=4.0
+
+# Server runtime
+uvicorn>=0.20
+starlette>=0.27
