@@ -250,23 +250,26 @@ class TestQQQHedgeSignal:
         assert "date" in result
         assert result["position"] < 0
 
-    def test_specific_date(self):
+    def test_date_range(self):
         from mcp_server import qqq_hedge_signal
         mock = self._mock_ohlcv()
-        target_date = str(mock["close"].index[400].date())
         with patch("lib.data.load_ohlcv_yfinance", return_value=mock):
-            result = qqq_hedge_signal(date=target_date)
+            result = qqq_hedge_signal(from_date="2020-03-01", to_date="2020-03-31")
         assert "error" not in result
-        assert result["date"] == target_date
+        assert "daily" in result
+        assert result["n_trading_days"] > 0
+        # Each entry should have position and date
+        for entry in result["daily"]:
+            assert "date" in entry
+            assert "position" in entry
+            assert entry["position"] < 0
 
-    def test_date_not_trading_day(self):
+    def test_date_range_empty(self):
         from mcp_server import qqq_hedge_signal
         mock = self._mock_ohlcv()
-        # Use a Saturday — should snap to previous trading day
         with patch("lib.data.load_ohlcv_yfinance", return_value=mock):
-            result = qqq_hedge_signal(date="2020-06-06")
-        assert "error" not in result
-        assert result["date"] <= "2020-06-06"
+            result = qqq_hedge_signal(from_date="2030-01-01", to_date="2030-01-31")
+        assert "error" in result
 
 
 class TestQQQHedgeBacktest:

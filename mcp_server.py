@@ -268,17 +268,21 @@ def gate_factor(
 
 @mcp.tool()
 def qqq_hedge_signal(
-    date: str = "latest",
+    from_date: str | None = None,
+    to_date: str | None = None,
 ) -> dict:
-    """Get the QQQ hedge position for a given date.
+    """Get the QQQ hedge position for today, or for each day in a date range.
 
     Fetches QQQ price data, computes all indicators (SMA50, SMA200, drawdown,
-    rally from trough), and returns the hedge position. The hedge overlay
-    protects a long tech portfolio by scaling short exposure based on drawdown
-    severity, trend position, and recovery signals.
+    rally from trough), and returns the hedge position(s).
+
+    - Called with no arguments: returns today's (latest) hedge position.
+    - Called with from_date and to_date: returns the hedge position for every
+      trading day in that range.
 
     Args:
-        date: Date to compute hedge for (ISO format, e.g. "2025-03-28"). Use "latest" for the most recent trading day.
+        from_date: Start date (ISO format, e.g. "2025-12-01"). Omit for latest only.
+        to_date: End date (ISO format, e.g. "2026-03-28"). Omit for latest only.
     """
     import pandas as pd
 
@@ -297,41 +301,50 @@ def qqq_hedge_signal(
         close = ohlcv["close"]["QQQ"]
         indicators = compute_hedge_indicators(close)
 
-        # Resolve target date
-        if date == "latest":
-            target = indicators.index[-1]
-        else:
-            target = pd.Timestamp(date)
-            if target not in indicators.index:
-                # Find nearest trading day on or before the requested date
-                valid = indicators.index[indicators.index <= target]
-                if valid.empty:
-                    return {"error": f"No data available for or before {date}"}
-                target = valid[-1]
+        def _compute_for_date(target, signal):
+            row = indicators.loc[target]
+            close_val = float(close.loc[target])
+            position = signal.update(
+                close=close_val,
+                sma200=float(row["sma200"]),
+                sma50=float(row["sma50"]),
+                drawdown=float(row["drawdown"]),
+                rally_from_trough=float(row["rally_from_trough"]),
+            )
+            return {
+                "date": str(target.date()),
+                "position": position,
+                "position_pct": f"{abs(position) * 100:.1f}% short",
+                "close": round(close_val, 2),
+                "sma200": round(float(row["sma200"]), 2),
+                "drawdown": round(float(row["drawdown"]), 4),
+            }
 
-        row = indicators.loc[target]
-        close_val = float(close.loc[target])
+        # --- Date range mode ---
+        if from_date is not None and to_date is not None:
+            start_ts = pd.Timestamp(from_date)
+            end_ts = pd.Timestamp(to_date)
+            mask = (indicators.index >= start_ts) & (indicators.index <= end_ts)
+            dates_in_range = indicators.index[mask]
 
+            if dates_in_range.empty:
+                return {"error": f"No trading days found between {from_date} and {to_date}"}
+
+            signal = QQQHedgeSignal()
+            daily = [_compute_for_date(dt, signal) for dt in dates_in_range]
+
+            return {
+                "from_date": str(dates_in_range[0].date()),
+                "to_date": str(dates_in_range[-1].date()),
+                "n_trading_days": len(daily),
+                "daily": daily,
+            }
+
+        # --- Single date mode (default: latest) ---
+        target = indicators.index[-1]
         signal = QQQHedgeSignal()
-        position = signal.update(
-            close=close_val,
-            sma200=float(row["sma200"]),
-            sma50=float(row["sma50"]),
-            drawdown=float(row["drawdown"]),
-            rally_from_trough=float(row["rally_from_trough"]),
-        )
+        return _compute_for_date(target, signal)
 
-        return {
-            "date": str(target.date()),
-            "position": position,
-            "position_pct": f"{abs(position) * 100:.1f}% short",
-            "is_hedging_beyond_base": position < -0.06,
-            "close": round(close_val, 2),
-            "sma50": round(float(row["sma50"]), 2),
-            "sma200": round(float(row["sma200"]), 2),
-            "drawdown": round(float(row["drawdown"]), 4),
-            "rally_from_trough": round(float(row["rally_from_trough"]), 4),
-        }
     except Exception as e:
         logger.error(f"qqq_hedge_signal failed: {traceback.format_exc()}")
         return {"error": str(e)}
