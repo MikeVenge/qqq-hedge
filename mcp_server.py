@@ -580,6 +580,19 @@ def log_resource() -> str:
 
 
 # ===========================================================================
+# Health check route (for Railway)
+# ===========================================================================
+
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health(request: Request) -> JSONResponse:
+    return JSONResponse({"status": "ok", "server": "System Factors MCP"})
+
+
+# ===========================================================================
 # Entry point
 # ===========================================================================
 
