@@ -268,26 +268,24 @@ def gate_factor(
 
 @mcp.tool()
 def qqq_hedge_signal(
-    from_date: str | None = None,
-    to_date: str | None = None,
+    date: str | None = None,
+    vt: float = 15,
 ) -> dict:
-    """Get the QQQ hedge position for today, or for each day in a date range.
+    """Get the QQQ hedging parameters as of a date for a chosen vol-target level.
 
-    Fetches QQQ price data, computes all indicators (SMA50, SMA200, drawdown,
-    rally from trough), and returns the hedge position(s).
-
-    - Called with no arguments: returns today's (latest) hedge position.
-    - Called with from_date and to_date: returns the hedge position for every
-      trading day in that range.
+    Two-layer overlay: an SMA100/SMA200 regime gate (1.0 / 0.5 / 0.0) times an
+    inverse-vol scalar min(target_vol / rv20, 1.5). Returns the gross long
+    deployment (exposure) and the cash sleeve (= 1 - exposure; negative = financed
+    leverage). Fetches QQQ historical closing prices from Alpha Vantage.
 
     Args:
-        from_date: Start date (ISO format, e.g. "2025-12-01"). Omit for latest only.
-        to_date: End date (ISO format, e.g. "2026-03-28"). Omit for latest only.
+        date: As-of date (ISO format, e.g. "2026-05-28"). Rolls back to the most
+              recent trading day on/before it. Omit for the latest trading day.
+        vt: Vol-target level (any positive number). 15 -> VT15 -> target_vol 0.15;
+            23 -> VT23 -> target_vol 0.23. Default 15.
     """
-    import pandas as pd
-
     from lib.data import load_ohlcv_alphavantage
-    from lib.qqq_hedge import QQQHedgeSignal, compute_hedge_indicators
+    from lib.qqq_hedge import hedge_parameters
 
     try:
         ohlcv = load_ohlcv_alphavantage(["QQQ"], start="2019-01-01")
@@ -296,51 +294,9 @@ def qqq_hedge_signal(
             return {"error": "Could not load QQQ data from Alpha Vantage"}
 
         close = ohlcv["close"]["QQQ"]
-        indicators = compute_hedge_indicators(close)
+        returns = ohlcv["returns"]["QQQ"]
 
-        def _compute_for_date(target, signal):
-            row = indicators.loc[target]
-            close_val = float(close.loc[target])
-            position = signal.update(
-                close=close_val,
-                sma200=float(row["sma200"]),
-                sma50=float(row["sma50"]),
-                drawdown=float(row["drawdown"]),
-                rally_from_trough=float(row["rally_from_trough"]),
-            )
-            return {
-                "date": str(target.date()),
-                "position": position,
-                "position_pct": f"{abs(position) * 100:.1f}% short",
-                "close": round(close_val, 2),
-                "sma200": round(float(row["sma200"]), 2),
-                "drawdown": round(float(row["drawdown"]), 4),
-            }
-
-        # --- Date range mode ---
-        if from_date is not None and to_date is not None:
-            start_ts = pd.Timestamp(from_date)
-            end_ts = pd.Timestamp(to_date)
-            mask = (indicators.index >= start_ts) & (indicators.index <= end_ts)
-            dates_in_range = indicators.index[mask]
-
-            if dates_in_range.empty:
-                return {"error": f"No trading days found between {from_date} and {to_date}"}
-
-            signal = QQQHedgeSignal()
-            daily = [_compute_for_date(dt, signal) for dt in dates_in_range]
-
-            return {
-                "from_date": str(dates_in_range[0].date()),
-                "to_date": str(dates_in_range[-1].date()),
-                "n_trading_days": len(daily),
-                "daily": daily,
-            }
-
-        # --- Single date mode (default: latest) ---
-        target = indicators.index[-1]
-        signal = QQQHedgeSignal()
-        return _compute_for_date(target, signal)
+        return hedge_parameters(close, returns, as_of=date, vt=vt)
 
     except Exception as e:
         logger.error(f"qqq_hedge_signal failed: {traceback.format_exc()}")
@@ -351,26 +307,26 @@ def qqq_hedge_signal(
 def qqq_hedge_backtest(
     start: str = "2020-01-01",
     end: str = "2026-12-31",
-    base_hedge: float = -0.05,
-    dd_tier_1: float = -0.03,
-    dd_tier_2: float = -0.07,
-    dd_tier_3: float = -0.12,
+    vt: float = 15,
+    leverage_cap: float = 1.5,
+    fed_funds_rate: float = 0.0,
 ) -> dict:
-    """Run a full historical backtest of the QQQ tail risk hedge overlay.
+    """Backtest the QQQ two-layer vol-target overlay vs buy-and-hold.
 
-    Compares a hedged portfolio (100% long QQQ + hedge) against buy-and-hold.
-    Returns performance stats including Sharpe, max drawdown reduction, and return cost.
+    The overlay sizes gross long deployment as gate(SMA100/200) x
+    min(target_vol / rv20, leverage_cap); the cash sleeve (1 - exposure) earns
+    fed_funds_rate. Returns performance stats (Sharpe, max DD, Calmar, mean
+    exposure / w_vol, % at leverage cap). Fetches QQQ closes from Alpha Vantage.
 
     Args:
         start: Backtest start date (ISO format, default "2020-01-01")
         end: Backtest end date (ISO format, default "2026-12-31")
-        base_hedge: Always-on base short position (default -0.05 = 5% short)
-        dd_tier_1: Mild drawdown threshold (default -0.03)
-        dd_tier_2: Moderate drawdown threshold (default -0.07)
-        dd_tier_3: Severe drawdown threshold (default -0.12)
+        vt: Vol-target level (e.g. 15 -> VT15 -> target_vol 0.15). Default 15.
+        leverage_cap: Cap on the inverse-vol scalar (default 1.5).
+        fed_funds_rate: Annual rate earned by the cash sleeve (default 0.0).
     """
     from lib.data import load_ohlcv_alphavantage
-    from lib.qqq_hedge import HedgeConfig, QQQHedgeSignal
+    from lib.qqq_hedge import QQQVolTargetSignal, VolTargetConfig
 
     try:
         ohlcv = load_ohlcv_alphavantage(["QQQ"], start=start, end=end)
@@ -381,14 +337,11 @@ def qqq_hedge_backtest(
         close = ohlcv["close"]["QQQ"]
         returns = ohlcv["returns"]["QQQ"]
 
-        config = HedgeConfig(
-            base_hedge=base_hedge,
-            dd_tier_1=dd_tier_1,
-            dd_tier_2=dd_tier_2,
-            dd_tier_3=dd_tier_3,
-        )
+        config = VolTargetConfig.from_vt(vt, leverage_cap=leverage_cap)
 
-        result = QQQHedgeSignal.backtest(close, returns, config)
+        result = QQQVolTargetSignal.backtest(
+            close, returns, config, fed_funds_rate=fed_funds_rate
+        )
         stats = result["stats"]
 
         # Format stats for readability
@@ -399,16 +352,18 @@ def qqq_hedge_backtest(
             else:
                 formatted_stats[k] = v
 
-        # Last 10 positions
-        hedge_pos = result["hedge_position"]
+        # Last 10 exposures
+        exposure = result["exposure"].dropna()
         recent = [
-            {"date": str(d.date()), "position": round(float(p), 4)}
-            for d, p in hedge_pos.tail(10).items()
+            {"date": str(d.date()), "exposure": round(float(p), 4)}
+            for d, p in exposure.tail(10).items()
         ]
 
         return {
+            "vt": float(vt),
+            "target_vol": round(config.target_vol, 4),
             "stats": formatted_stats,
-            "recent_positions": recent,
+            "recent_exposures": recent,
             "data_range": f"{close.index.min().date()} to {close.index.max().date()}",
             "n_trading_days": len(close),
         }

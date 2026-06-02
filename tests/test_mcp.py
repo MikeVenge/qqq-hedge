@@ -246,29 +246,42 @@ class TestQQQHedgeSignal:
         with patch("lib.data.load_ohlcv_alphavantage", return_value=mock):
             result = qqq_hedge_signal()
         assert "error" not in result
-        assert "position" in result
-        assert "date" in result
-        assert result["position"] < 0
+        assert "exposure" in result
+        assert "as_of_date" in result
+        # Exposure is a long deployment in [0, 1.5], never short
+        assert 0.0 <= result["exposure"] <= 1.5
+        assert result["gate"] in (0.0, 0.5, 1.0)
+        assert result["vt"] == 15
 
-    def test_date_range(self):
+    def test_as_of_date_and_vt(self):
         from mcp_server import qqq_hedge_signal
         mock = self._mock_ohlcv()
         with patch("lib.data.load_ohlcv_alphavantage", return_value=mock):
-            result = qqq_hedge_signal(from_date="2020-03-01", to_date="2020-03-31")
+            result = qqq_hedge_signal(date="2020-06-15", vt=23)
         assert "error" not in result
-        assert "daily" in result
-        assert result["n_trading_days"] > 0
-        # Each entry should have position and date
-        for entry in result["daily"]:
-            assert "date" in entry
-            assert "position" in entry
-            assert entry["position"] < 0
+        assert result["vt"] == 23
+        assert abs(result["target_vol"] - 0.23) < 1e-9
+        # as_of rolls back to the most recent trading day on/before the request
+        assert result["as_of_date"] <= "2020-06-15"
+        assert 0.0 <= result["exposure"] <= 1.5
+        # exposure reconciles with gate x min(target_vol / rv20, 1.5)
+        expected_w = min(0.23 / result["rv20"], 1.5)
+        assert abs(result["w_vol"] - expected_w) < 1e-6
+        assert abs(result["exposure"] - result["gate"] * result["w_vol"]) < 1e-6
 
-    def test_date_range_empty(self):
+    def test_date_before_data(self):
         from mcp_server import qqq_hedge_signal
         mock = self._mock_ohlcv()
         with patch("lib.data.load_ohlcv_alphavantage", return_value=mock):
-            result = qqq_hedge_signal(from_date="2030-01-01", to_date="2030-01-31")
+            result = qqq_hedge_signal(date="2015-01-01")
+        assert "error" in result
+
+    def test_insufficient_history(self):
+        from mcp_server import qqq_hedge_signal
+        mock = self._mock_ohlcv()
+        # Within the first ~200 sessions -> SMA200 not yet defined
+        with patch("lib.data.load_ohlcv_alphavantage", return_value=mock):
+            result = qqq_hedge_signal(date="2019-04-01")
         assert "error" in result
 
 
@@ -294,8 +307,11 @@ class TestQQQHedgeBacktest:
 
         assert "error" not in result
         assert "stats" in result
-        assert "recent_positions" in result
-        assert len(result["recent_positions"]) <= 10
+        assert "recent_exposures" in result
+        assert len(result["recent_exposures"]) <= 10
+        # Exposures are long deployments in [0, 1.5]
+        for entry in result["recent_exposures"]:
+            assert 0.0 <= entry["exposure"] <= 1.5
 
 
 # ---------------------------------------------------------------------------

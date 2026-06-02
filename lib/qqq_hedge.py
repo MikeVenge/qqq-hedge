@@ -1,35 +1,46 @@
 """
-QQQ Tail Risk Overlay — production hedge signal module.
+QQQ Two-Layer Vol-Target Overlay — production hedge signal module.
 
-Generates a daily short-hedge position for QQQ to protect a long tech portfolio.
-Combines a permanent base hedge with drawdown-reactive scaling, trend awareness,
-and a fast-exit mechanism to avoid being caught short during V-shaped recoveries.
+Generates a daily *gross long deployment* for QQQ (0% .. 150%), with the
+remainder held in a cash sleeve. This replaces the older short-hedge overlay:
+the signal is now a long-exposure / cash-allocation model, never a short.
 
-Strategy summary:
-  - Always carry a small base short (-5%) as insurance
-  - Scale up short when drawdown deepens (-3% → -7% → -12% thresholds)
-  - Add short exposure when price drops below SMA200
-  - Fast exit: if QQQ rallies >10% from its 15-day trough, snap back to base
+Two multiplicative layers:
 
-Performance (2020-01-02 to 2026-03-27, real Alpha Vantage data):
-  - Portfolio = 100% long QQQ + hedge overlay
-  - Cumulative: +165.7% (vs B&H +170.4%) — only 4.8% drag over 6 years
-  - MaxDD: -24.2% (vs B&H -35.1%) — 10.9%pts reduction
-  - Sharpe: 0.93 (vs B&H 0.76)
-  - 2022 bear: saved 11.4%pts of drawdown
-  - 2025 selloff: saved 6.7%pts of drawdown
+  Layer 1 — SMA regime gate (direction):
+      close > SMA100 and close > SMA200  -> gate = 1.0   (risk-on)
+      close > exactly one of them        -> gate = 0.5   (half)
+      close < both                       -> gate = 0.0   (full de-risk to cash)
+
+  Layer 2 — inverse-vol scalar (magnitude):
+      w_vol = min( target_vol / rv20(t-1), 1.50 )
+      rv20  = trailing 20-day realized vol of QQQ, annualized (x sqrt(252))
+      target_vol = vt / 100   (e.g. vt=15 -> VT15 -> 0.15)
+
+  Combined:
+      exposure = gate * w_vol          (0 .. 1.5)
+      cash     = 1 - exposure          (negative = financed leverage)
+
+The "vt" level is an arbitrary positive number (15, 12, 10, 23, 12.5, ...).
+Each config is fully invested (0% cash) exactly when QQQ's trailing realized
+vol equals its target; above that the inverse-vol scalar moves capital to cash,
+below it the scalar finances leverage up to the 1.50x cap.
 
 Usage:
-    from lib.qqq_hedge import QQQHedgeSignal
+    from lib.qqq_hedge import hedge_parameters
+    from lib.data import load_ohlcv_alphavantage
 
-    signal = QQQHedgeSignal()
-    signal.update(close=510.25, sma200=485.0, drawdown=-0.04, rally_from_trough=0.03)
-    position = signal.position  # e.g. -0.20 (20% short)
+    ohlcv = load_ohlcv_alphavantage(["QQQ"], start="2019-01-01")
+    close = ohlcv["close"]["QQQ"]
+    returns = ohlcv["returns"]["QQQ"]
+
+    params = hedge_parameters(close, returns, as_of="2026-05-28", vt=23)
+    # -> {"as_of_date": "2026-05-28", "exposure": ..., "cash_pct": ..., ...}
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -41,215 +52,221 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 
 @dataclass
-class HedgeConfig:
-    """Tunable parameters for the tail risk overlay."""
+class VolTargetConfig:
+    """Tunable parameters for the two-layer vol-target overlay."""
 
-    # Base hedge: always-on short (insurance premium)
-    base_hedge: float = -0.05
+    # Layer 2: target (full-deployment) annualized vol. vt=15 -> 0.15.
+    target_vol: float = 0.15
 
-    # Drawdown tiers: (threshold, additional short size)
-    dd_tier_1: float = -0.03   # mild drawdown
-    dd_size_1: float = -0.15
-    dd_tier_2: float = -0.07   # moderate drawdown
-    dd_size_2: float = -0.30
-    dd_tier_3: float = -0.12   # severe drawdown
-    dd_size_3: float = -0.50
+    # Realized-vol estimation
+    vol_window: int = 20            # trailing window (trading days)
+    annualization: float = 252.0    # trading days per year (vol scales by sqrt)
 
-    # Trend overlay
-    below_sma200_size: float = -0.20
-    below_sma50_size: float = -0.10
+    # Leverage cap on the inverse-vol scalar
+    leverage_cap: float = 1.50
 
-    # Fast exit: snap to base when recovery is confirmed
-    fast_exit_rally_thresh: float = 0.10   # 10% rally from trough
-    fast_exit_trough_window: int = 15      # 15-day lookback for trough
+    # Layer 1: SMA regime gate windows
+    sma_fast: int = 100
+    sma_slow: int = 200
 
-    # Position limits
-    max_short: float = -1.00   # never exceed 100% short
-    min_short: float = -0.05   # always at least 5% short (base)
+    # Gate values for {both above, one above, neither above}
+    gate_both: float = 1.0
+    gate_one: float = 0.5
+    gate_none: float = 0.0
 
     def validate(self) -> None:
-        assert self.base_hedge < 0, "base_hedge must be negative"
-        assert self.dd_tier_1 > self.dd_tier_2 > self.dd_tier_3, "DD tiers must be descending"
-        assert self.max_short <= self.min_short < 0, "max_short <= min_short < 0"
+        assert self.target_vol > 0, "target_vol must be positive"
+        assert self.leverage_cap >= 1.0, "leverage_cap must be >= 1.0"
+        assert self.vol_window >= 2, "vol_window must be >= 2"
+        assert self.sma_fast > 0 and self.sma_slow > 0, "SMA windows must be positive"
+
+    @classmethod
+    def from_vt(cls, vt: float, **overrides) -> "VolTargetConfig":
+        """Build a config from a vt level (vt=23 -> target_vol=0.23)."""
+        return cls(target_vol=float(vt) / 100.0, **overrides)
+
+
+def config_for_vt(vt: float) -> VolTargetConfig:
+    """Convenience: VolTargetConfig for a given vt level."""
+    cfg = VolTargetConfig.from_vt(vt)
+    cfg.validate()
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Indicators
+# ---------------------------------------------------------------------------
+
+def compute_exposure_indicators(
+    close: pd.Series,
+    returns: Optional[pd.Series] = None,
+    config: Optional[VolTargetConfig] = None,
+) -> pd.DataFrame:
+    """Compute the indicators needed for the exposure signal.
+
+    Returns DataFrame with columns: sma_fast, sma_slow, rv20.
+      - sma_fast / sma_slow : simple moving averages (default 100 / 200)
+      - rv20                : trailing 20d realized vol, annualized, LAGGED one
+                              day (the value known as of the prior close, per
+                              the model's sigma_realized(t-1) convention).
+    """
+    cfg = config or VolTargetConfig()
+    if returns is None:
+        returns = close.pct_change()
+    returns = returns.reindex(close.index)
+
+    sma_fast = close.rolling(cfg.sma_fast, min_periods=cfg.sma_fast).mean()
+    sma_slow = close.rolling(cfg.sma_slow, min_periods=cfg.sma_slow).mean()
+
+    rv = returns.rolling(cfg.vol_window, min_periods=cfg.vol_window).std(ddof=1)
+    rv = rv * np.sqrt(cfg.annualization)
+    rv20 = rv.shift(1)  # use vol realized through t-1 to size position at t
+
+    return pd.DataFrame(
+        {"sma_fast": sma_fast, "sma_slow": sma_slow, "rv20": rv20},
+        index=close.index,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Signal generator
 # ---------------------------------------------------------------------------
 
-class QQQHedgeSignal:
-    """Stateful hedge signal generator for QQQ tail risk overlay.
+class QQQVolTargetSignal:
+    """Two-layer (regime gate x inverse-vol) long-exposure signal for QQQ."""
 
-    Can be used in two modes:
-    1. Live / bar-by-bar: call update() with current market data each day
-    2. Vectorized backtest: call from_series() with full price history
-    """
+    @staticmethod
+    def _gate(above_fast: bool, above_slow: bool, cfg: VolTargetConfig) -> float:
+        n = int(bool(above_fast)) + int(bool(above_slow))
+        return {2: cfg.gate_both, 1: cfg.gate_one, 0: cfg.gate_none}[n]
 
-    def __init__(self, config: Optional[HedgeConfig] = None):
-        self.config = config or HedgeConfig()
-        self.config.validate()
-        self._position: float = self.config.base_hedge
-        self._last_update: Optional[pd.Timestamp] = None
-
-    @property
-    def position(self) -> float:
-        """Current hedge position (negative = short)."""
-        return self._position
-
-    @property
-    def is_hedging(self) -> bool:
-        """Whether hedge is active beyond base level."""
-        return self._position < self.config.base_hedge - 0.01
-
-    def update(
-        self,
+    @classmethod
+    def compute(
+        cls,
         close: float,
-        sma200: float,
-        sma50: Optional[float] = None,
-        drawdown: float = 0.0,
-        rally_from_trough: float = 0.0,
-        date: Optional[pd.Timestamp] = None,
-    ) -> float:
-        """Compute hedge position for today.
+        sma_fast: float,
+        sma_slow: float,
+        rv20: float,
+        config: Optional[VolTargetConfig] = None,
+    ) -> dict:
+        """Compute the exposure for a single point.
 
         Args:
-            close: Current closing price
-            sma200: 200-day simple moving average
-            sma50: 50-day simple moving average (optional)
-            drawdown: Current drawdown from 252-day rolling peak (e.g. -0.08)
-            rally_from_trough: Price rally from N-day trough (e.g. 0.12 = +12%)
-            date: Current date (for logging)
-
-        Returns:
-            Hedge position (negative = short, e.g. -0.20 means 20% short)
+            close: closing price
+            sma_fast / sma_slow: moving averages (default 100 / 200)
+            rv20: trailing annualized realized vol used to size (t-1)
+        Returns dict: gate, w_vol, exposure, cash, leverage_capped.
         """
-        cfg = self.config
-
-        # 1. Base hedge
-        pos = cfg.base_hedge
-
-        # 2. Drawdown-reactive scaling
-        if drawdown < cfg.dd_tier_3:
-            pos += cfg.dd_size_3
-        elif drawdown < cfg.dd_tier_2:
-            pos += cfg.dd_size_2
-        elif drawdown < cfg.dd_tier_1:
-            pos += cfg.dd_size_1
-
-        # 3. Trend overlay
-        if close < sma200:
-            pos += cfg.below_sma200_size
-        elif sma50 is not None and close < sma50:
-            pos += cfg.below_sma50_size
-
-        # 4. Fast exit: if strong rally from trough, snap to base
-        if rally_from_trough > cfg.fast_exit_rally_thresh:
-            pos = max(pos, cfg.base_hedge)
-
-        # 5. Clamp
-        pos = max(cfg.max_short, min(cfg.min_short, pos))
-
-        self._position = pos
-        self._last_update = date
-        return pos
-
-    # -------------------------------------------------------------------
-    # Vectorized interface for backtesting
-    # -------------------------------------------------------------------
+        cfg = config or VolTargetConfig()
+        gate = cls._gate(close > sma_fast, close > sma_slow, cfg)
+        raw = cfg.target_vol / rv20
+        capped = raw >= cfg.leverage_cap
+        w_vol = min(raw, cfg.leverage_cap)
+        exposure = gate * w_vol
+        return {
+            "gate": gate,
+            "w_vol": w_vol,
+            "exposure": exposure,
+            "cash": 1.0 - exposure,
+            "leverage_capped": bool(capped),
+        }
 
     @classmethod
     def from_series(
         cls,
         close: pd.Series,
-        config: Optional[HedgeConfig] = None,
-    ) -> pd.Series:
-        """Compute hedge positions for an entire price series.
+        returns: Optional[pd.Series] = None,
+        config: Optional[VolTargetConfig] = None,
+    ) -> pd.DataFrame:
+        """Vectorized exposure for an entire price series.
 
-        Args:
-            close: Daily closing prices (DatetimeIndex)
-            config: Hedge configuration (uses defaults if None)
-
-        Returns:
-            pd.Series of hedge positions (negative = short), same index as close
+        Returns DataFrame (same index as close) with columns:
+            gate, w_vol, exposure, cash, leverage_capped,
+            rv20, close, sma_fast, sma_slow
+        Rows lacking enough history (NaN SMA or rv20) yield NaN exposure.
         """
-        cfg = config or HedgeConfig()
+        cfg = config or VolTargetConfig()
         cfg.validate()
+        ind = compute_exposure_indicators(close, returns, cfg)
 
-        # Compute required indicators
-        sma50 = close.rolling(50, min_periods=30).mean()
-        sma200 = close.rolling(200, min_periods=120).mean()
+        sma_fast = ind["sma_fast"]
+        sma_slow = ind["sma_slow"]
+        rv20 = ind["rv20"]
 
-        rolling_peak = close.rolling(252, min_periods=1).max()
-        drawdown = (close - rolling_peak) / rolling_peak
+        valid_gate = sma_fast.notna() & sma_slow.notna()
+        n_above = (close > sma_fast).astype(float) + (close > sma_slow).astype(float)
+        gate = pd.Series(
+            np.select(
+                [n_above == 2, n_above == 1, n_above == 0],
+                [cfg.gate_both, cfg.gate_one, cfg.gate_none],
+                default=np.nan,
+            ),
+            index=close.index,
+        ).where(valid_gate)
 
-        trough = close.rolling(cfg.fast_exit_trough_window, min_periods=5).min()
-        rally_from_trough = close / trough - 1
+        raw = cfg.target_vol / rv20
+        leverage_capped = raw >= cfg.leverage_cap
+        w_vol = raw.clip(upper=cfg.leverage_cap)
 
-        # Vectorized position computation
-        pos = np.full(len(close), cfg.base_hedge)
+        exposure = gate * w_vol
+        cash = 1.0 - exposure
 
-        # Drawdown tiers
-        pos += np.where(drawdown < cfg.dd_tier_3, cfg.dd_size_3,
-               np.where(drawdown < cfg.dd_tier_2, cfg.dd_size_2,
-               np.where(drawdown < cfg.dd_tier_1, cfg.dd_size_1, 0.0)))
-
-        # Trend overlay
-        pos += np.where(close < sma200, cfg.below_sma200_size,
-               np.where(close < sma50, cfg.below_sma50_size, 0.0))
-
-        # Fast exit
-        fast_exit = rally_from_trough > cfg.fast_exit_rally_thresh
-        pos = np.where(fast_exit, np.maximum(pos, cfg.base_hedge), pos)
-
-        # Clamp
-        pos = np.clip(pos, cfg.max_short, cfg.min_short)
-
-        return pd.Series(pos, index=close.index, name="hedge_position")
+        return pd.DataFrame(
+            {
+                "gate": gate,
+                "w_vol": w_vol,
+                "exposure": exposure,
+                "cash": cash,
+                "leverage_capped": leverage_capped.where(rv20.notna()),
+                "rv20": rv20,
+                "close": close,
+                "sma_fast": sma_fast,
+                "sma_slow": sma_slow,
+            },
+            index=close.index,
+        )
 
     @classmethod
     def backtest(
         cls,
         close: pd.Series,
         returns: Optional[pd.Series] = None,
-        config: Optional[HedgeConfig] = None,
+        config: Optional[VolTargetConfig] = None,
+        fed_funds_rate: float = 0.0,
     ) -> dict:
-        """Run a full backtest of the hedge overlay on a long QQQ portfolio.
+        """Backtest the overlay on long QQQ with a cash sleeve.
 
-        Args:
-            close: Daily closing prices
-            returns: Daily returns (computed from close if not provided)
-            config: Hedge configuration
+        Position decided at close t earns the t -> t+1 return; the cash sleeve
+        (1 - exposure) earns the (annual) fed_funds_rate. Lookahead-free.
 
-        Returns:
-            dict with:
-              - hedge_position: pd.Series of daily hedge positions
-              - portfolio_returns: pd.Series of hedged portfolio daily returns
-              - buyhold_returns: pd.Series of buy-and-hold daily returns
-              - stats: dict of performance metrics
+        Returns dict:
+            exposure (Series), portfolio_returns, buyhold_returns, stats
         """
+        cfg = config or VolTargetConfig()
         if returns is None:
-            returns = close.pct_change().dropna()
+            returns = close.pct_change()
+        returns = returns.reindex(close.index)
 
-        hedge_pos = cls.from_series(close, config)
+        df = cls.from_series(close, returns, cfg)
+        exposure = df["exposure"]
+        w_vol = df["w_vol"]
 
-        # Portfolio = 100% long + hedge overlay, with 1-day lag
-        h = hedge_pos.shift(1).fillna(0)
-        fwd_1d = returns.shift(-1)
+        # exposure decided at t earns r_{t+1}  ->  exposure.shift(1) * r_t
+        e_lag = exposure.shift(1)
+        ff_daily = fed_funds_rate / cfg.annualization
+        portfolio_ret = e_lag * returns + (1.0 - e_lag) * ff_daily
+        buyhold_ret = returns.copy()
 
-        portfolio_ret = (1.0 + h) * fwd_1d
-        buyhold_ret = fwd_1d.copy()
-
-        # Compute stats
         def compute_stats(rets: pd.Series, label: str) -> dict:
             rets = rets.dropna()
             if len(rets) < 10:
                 return {}
-            ann_ret = rets.mean() * 252
-            ann_vol = rets.std() * np.sqrt(252)
-            sharpe = ann_ret / ann_vol if ann_vol > 0 else 0
+            ann_ret = rets.mean() * cfg.annualization
+            ann_vol = rets.std() * np.sqrt(cfg.annualization)
+            sharpe = ann_ret / ann_vol if ann_vol > 0 else 0.0
             cum = (1 + rets).cumprod()
             max_dd = (cum / cum.cummax() - 1).min()
-            calmar = ann_ret / abs(max_dd) if max_dd != 0 else 0
+            calmar = ann_ret / abs(max_dd) if max_dd != 0 else 0.0
             total_ret = cum.iloc[-1] - 1
             return {
                 f"{label}_annual_return": ann_ret,
@@ -263,23 +280,25 @@ class QQQHedgeSignal:
         p_stats = compute_stats(portfolio_ret, "portfolio")
         b_stats = compute_stats(buyhold_ret, "buyhold")
 
-        # Hedge activity stats
-        short_pct = (h < -0.06).mean()
-        avg_hedge = h.mean()
-        enters = ((h < -0.06) & ~(h.shift(1) < -0.06)).sum()
+        exp_valid = exposure.dropna()
+        wv_valid = w_vol.dropna()
+        capped = df["leverage_capped"].dropna()
 
         stats = {
             **p_stats,
             **b_stats,
             "dd_reduction": b_stats.get("buyhold_max_dd", 0) - p_stats.get("portfolio_max_dd", 0),
             "return_cost": p_stats.get("portfolio_annual_return", 0) - b_stats.get("buyhold_annual_return", 0),
-            "pct_time_hedging": short_pct,
-            "avg_hedge_size": avg_hedge,
-            "n_hedge_entries": int(enters),
+            "mean_exposure": float(exp_valid.mean()) if len(exp_valid) else 0.0,
+            "mean_w_vol": float(wv_valid.mean()) if len(wv_valid) else 0.0,
+            "pct_in_cash": float((exp_valid < 1.0).mean()) if len(exp_valid) else 0.0,
+            "pct_levered": float((exp_valid > 1.0).mean()) if len(exp_valid) else 0.0,
+            "pct_at_leverage_cap": float(capped.mean()) if len(capped) else 0.0,
+            "target_vol": cfg.target_vol,
         }
 
         return {
-            "hedge_position": hedge_pos,
+            "exposure": exposure,
             "portfolio_returns": portfolio_ret,
             "buyhold_returns": buyhold_ret,
             "stats": stats,
@@ -287,24 +306,78 @@ class QQQHedgeSignal:
 
 
 # ---------------------------------------------------------------------------
-# Convenience: compute indicators from close price
+# Public helper: build the "hedging parameters" output dict
 # ---------------------------------------------------------------------------
 
-def compute_hedge_indicators(close: pd.Series) -> pd.DataFrame:
-    """Compute all indicators needed for the hedge signal from a close price series.
+_REGIME_LABELS = {1.0: "risk-on", 0.5: "half", 0.0: "cash"}
 
-    Returns DataFrame with columns: sma50, sma200, drawdown, rally_from_trough
+
+def hedge_parameters(
+    close: pd.Series,
+    returns: Optional[pd.Series] = None,
+    as_of: Optional[str] = None,
+    vt: float = 15.0,
+    config: Optional[VolTargetConfig] = None,
+) -> dict:
+    """Compute the QQQ hedging parameters as of a date for a given vt level.
+
+    Args:
+        close: QQQ close prices (DatetimeIndex)
+        returns: daily returns (computed from close if None)
+        as_of: ISO date string; rolls back to the most recent trading day on or
+               before it. None -> latest available trading day.
+        vt: vol-target level (15 -> VT15 -> target_vol 0.15). Any positive number.
+
+    Returns a dict of hedging parameters, or {"error": ...} on failure.
     """
-    sma50 = close.rolling(50, min_periods=30).mean()
-    sma200 = close.rolling(200, min_periods=120).mean()
-    rolling_peak = close.rolling(252, min_periods=1).max()
-    drawdown = (close - rolling_peak) / rolling_peak
-    trough_15 = close.rolling(15, min_periods=5).min()
-    rally = close / trough_15 - 1
+    if config is None:
+        config = VolTargetConfig.from_vt(vt)
+    config.validate()
 
-    return pd.DataFrame({
-        "sma50": sma50,
-        "sma200": sma200,
-        "drawdown": drawdown,
-        "rally_from_trough": rally,
-    }, index=close.index)
+    df = QQQVolTargetSignal.from_series(close, returns, config)
+
+    if as_of is None:
+        target = df.index[-1]
+    else:
+        ts = pd.Timestamp(as_of)
+        prior = df.index[df.index <= ts]
+        if len(prior) == 0:
+            return {"error": f"No QQQ trading day on or before {as_of}"}
+        target = prior[-1]
+
+    row = df.loc[target]
+    if pd.isna(row["exposure"]):
+        return {
+            "error": (
+                f"Insufficient history to compute the signal as of "
+                f"{target.date()} (need >= {config.sma_slow} sessions of data)."
+            )
+        }
+
+    exposure = float(row["exposure"])
+    cash = 1.0 - exposure
+    gate = float(row["gate"])
+    regime = _REGIME_LABELS.get(round(gate, 3), f"gate={gate:.2f}")
+    cash_desc = (
+        f"{cash * 100:.1f}% cash" if cash >= 0 else f"{abs(cash) * 100:.1f}% leverage"
+    )
+
+    return {
+        "as_of_date": str(target.date()),
+        "requested_date": str(pd.Timestamp(as_of).date()) if as_of else str(target.date()),
+        "vt": float(vt),
+        "target_vol": round(config.target_vol, 4),
+        "exposure": round(exposure, 4),
+        "exposure_pct": f"{exposure * 100:.1f}% invested",
+        "cash": round(cash, 4),
+        "cash_pct": cash_desc,
+        "gate": gate,
+        "regime": regime,
+        "w_vol": round(float(row["w_vol"]), 4),
+        "leverage_capped": bool(row["leverage_capped"]),
+        "rv20": round(float(row["rv20"]), 4),
+        "rv20_pct": f"{float(row['rv20']) * 100:.1f}%",
+        "close": round(float(row["close"]), 2),
+        "sma100": round(float(row["sma_fast"]), 2),
+        "sma200": round(float(row["sma_slow"]), 2),
+    }
