@@ -12,6 +12,14 @@ Two multiplicative layers:
       close > exactly one of them        -> gate = 0.5   (half)
       close < both                       -> gate = 0.0   (full de-risk to cash)
 
+      Gate confirmation (symmetric): the gate only changes state after the new
+      SMA condition holds for `confirm_days` (default 3) consecutive closes --
+      both on the way DOWN (closing below) and on the way back UP (closing
+      above). Applied per SMA, so e.g. SMA100 can break (1.0 -> 0.5) before
+      SMA200 breaks (0.5 -> 0.0), and each side re-risks only after 3 confirmed
+      closes back above. Set confirm_days=1 for the instantaneous gate as
+      written in the source document.
+
   Layer 2 — inverse-vol scalar (magnitude):
       w_vol = min( target_vol / rv20(t-1), 1.50 )
       rv20  = trailing 20-day realized vol of QQQ, annualized (x sqrt(252))
@@ -74,11 +82,19 @@ class VolTargetConfig:
     gate_one: float = 0.5
     gate_none: float = 0.0
 
+    # Gate confirmation (symmetric): the gate only changes state after the new
+    # SMA condition holds for this many consecutive closes -- both on the way
+    # DOWN (price closing below) and on the way back UP (price closing above).
+    # Applied per SMA. Set to 1 to disable (instantaneous gate, as written in
+    # the source document).
+    confirm_days: int = 3
+
     def validate(self) -> None:
         assert self.target_vol > 0, "target_vol must be positive"
         assert self.leverage_cap >= 1.0, "leverage_cap must be >= 1.0"
         assert self.vol_window >= 2, "vol_window must be >= 2"
         assert self.sma_fast > 0 and self.sma_slow > 0, "SMA windows must be positive"
+        assert self.confirm_days >= 1, "confirm_days must be >= 1"
 
     @classmethod
     def from_vt(cls, vt: float, **overrides) -> "VolTargetConfig":
@@ -140,6 +156,34 @@ class QQQVolTargetSignal:
         n = int(bool(above_fast)) + int(bool(above_slow))
         return {2: cfg.gate_both, 1: cfg.gate_one, 0: cfg.gate_none}[n]
 
+    @staticmethod
+    def _debounced_above(close: pd.Series, sma: pd.Series, confirm_days: int) -> pd.Series:
+        """Symmetric `confirm_days`-debounced 'price above SMA' state.
+
+        The effective above/below state flips only after the raw condition
+        (close > sma) holds for `confirm_days` consecutive sessions, in BOTH
+        directions (down and up). Returns 1.0 (above) / 0.0 (below) / NaN
+        (sma undefined), aligned to close.index. The initial state is seeded
+        with the first valid raw reading (cold start).
+        """
+        valid = sma.notna()
+        raw = (close > sma)[valid]
+        out = pd.Series(np.nan, index=close.index)
+        if raw.empty:
+            return out
+        if confirm_days <= 1:
+            out.loc[raw.index] = raw.astype(float)
+            return out
+
+        raw_f = raw.astype(float)
+        run_id = (raw != raw.shift()).cumsum()
+        run_len = raw.groupby(run_id).cumcount() + 1
+        candidate = raw_f.where(run_len >= confirm_days)
+        candidate.iloc[0] = raw_f.iloc[0]   # seed initial state (cold start)
+        deb = candidate.ffill()
+        out.loc[deb.index] = deb
+        return out
+
     @classmethod
     def compute(
         cls,
@@ -183,6 +227,9 @@ class QQQVolTargetSignal:
         Returns DataFrame (same index as close) with columns:
             gate, w_vol, exposure, cash, leverage_capped,
             rv20, close, sma_fast, sma_slow
+        The gate applies the symmetric `confirm_days` debounce (per SMA): it
+        only changes state after the new SMA condition holds that many
+        consecutive closes, both down and up.
         Rows lacking enough history (NaN SMA or rv20) yield NaN exposure.
         """
         cfg = config or VolTargetConfig()
@@ -193,8 +240,11 @@ class QQQVolTargetSignal:
         sma_slow = ind["sma_slow"]
         rv20 = ind["rv20"]
 
+        cd = max(1, int(cfg.confirm_days))
+        above_fast = cls._debounced_above(close, sma_fast, cd)
+        above_slow = cls._debounced_above(close, sma_slow, cd)
         valid_gate = sma_fast.notna() & sma_slow.notna()
-        n_above = (close > sma_fast).astype(float) + (close > sma_slow).astype(float)
+        n_above = above_fast + above_slow
         gate = pd.Series(
             np.select(
                 [n_above == 2, n_above == 1, n_above == 0],
