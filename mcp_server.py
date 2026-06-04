@@ -8,12 +8,15 @@ Streamable HTTP transport.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import sys
 import traceback
+import uuid
 from collections import OrderedDict
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Ensure project root is on path
@@ -266,6 +269,24 @@ def gate_factor(
 # ===========================================================================
 
 
+def _compute_hedge_signal(date: str | None = None, vt: float = 15) -> dict:
+    """Shared core for the QQQ hedge signal (used by the MCP tool and REST API).
+
+    Blocking (Alpha Vantage fetch + pandas); call via a threadpool from async
+    contexts. Returns the hedging-parameters dict, or {"error": ...}.
+    """
+    from lib.data import load_ohlcv_alphavantage
+    from lib.qqq_hedge import hedge_parameters
+
+    ohlcv = load_ohlcv_alphavantage(["QQQ"], start="2019-01-01")
+    if ohlcv is None:
+        return {"error": "Could not load QQQ data from Alpha Vantage"}
+
+    close = ohlcv["close"]["QQQ"]
+    returns = ohlcv["returns"]["QQQ"]
+    return hedge_parameters(close, returns, as_of=date, vt=vt)
+
+
 @mcp.tool()
 def qqq_hedge_signal(
     date: str | None = None,
@@ -284,20 +305,8 @@ def qqq_hedge_signal(
         vt: Vol-target level (any positive number). 15 -> VT15 -> target_vol 0.15;
             23 -> VT23 -> target_vol 0.23. Default 15.
     """
-    from lib.data import load_ohlcv_alphavantage
-    from lib.qqq_hedge import hedge_parameters
-
     try:
-        ohlcv = load_ohlcv_alphavantage(["QQQ"], start="2019-01-01")
-
-        if ohlcv is None:
-            return {"error": "Could not load QQQ data from Alpha Vantage"}
-
-        close = ohlcv["close"]["QQQ"]
-        returns = ohlcv["returns"]["QQQ"]
-
-        return hedge_parameters(close, returns, as_of=date, vt=vt)
-
+        return _compute_hedge_signal(date, vt)
     except Exception as e:
         logger.error(f"qqq_hedge_signal failed: {traceback.format_exc()}")
         return {"error": str(e)}
@@ -551,6 +560,128 @@ from starlette.responses import JSONResponse
 @mcp.custom_route("/health", methods=["GET"])
 async def health(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "server": "System Factors MCP"})
+
+
+# ===========================================================================
+# Async REST API (submit + poll) for the QQQ hedge signal
+# ===========================================================================
+#
+#   POST /api/hedge            -> 202 { job_id, status: "pending", poll_url }
+#       body or query: { "date": "2026-05-28"(optional), "vt": 23(optional, def 15) }
+#   GET  /api/hedge/{job_id}   -> 202 while pending/running; 200 when done/error
+#       done  -> { status: "done",  result: {...hedging params...} }
+#       error -> { status: "error", error: "..." }
+#
+# Jobs are kept in memory (single Railway container); they are lost on restart
+# and the store is capped at _HEDGE_JOBS_MAX (oldest evicted).
+
+_HEDGE_JOBS: "OrderedDict[str, dict]" = OrderedDict()
+_HEDGE_JOBS_MAX = 1000
+_HEDGE_BG_TASKS: set = set()
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _store_job(job: dict) -> None:
+    _HEDGE_JOBS[job["job_id"]] = job
+    while len(_HEDGE_JOBS) > _HEDGE_JOBS_MAX:
+        _HEDGE_JOBS.popitem(last=False)
+
+
+async def _process_hedge_job(job_id: str, date: str | None, vt: float) -> None:
+    job = _HEDGE_JOBS.get(job_id)
+    if job is None:
+        return
+    job["status"] = "running"
+    try:
+        # Offload the blocking fetch + compute so the event loop stays free.
+        result = await asyncio.to_thread(_compute_hedge_signal, date, vt)
+        if isinstance(result, dict) and "error" in result:
+            job["status"] = "error"
+            job["error"] = result["error"]
+        else:
+            job["status"] = "done"
+            job["result"] = result
+    except Exception as e:
+        logger.error(f"hedge job {job_id} failed: {traceback.format_exc()}")
+        job["status"] = "error"
+        job["error"] = str(e)
+    job["completed_at"] = _now_iso()
+
+
+@mcp.custom_route("/api/hedge", methods=["POST"])
+async def submit_hedge_job(request: Request) -> JSONResponse:
+    """Submit an async QQQ hedge-signal job; returns 202 + job_id to poll."""
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+    except Exception:
+        body = {}
+
+    date = body.get("date")
+    if date in (None, ""):
+        date = request.query_params.get("date") or None
+
+    vt_raw = body.get("vt", request.query_params.get("vt", 15))
+    try:
+        vt = float(vt_raw)
+    except (TypeError, ValueError):
+        return JSONResponse({"error": f"invalid vt: {vt_raw!r}"}, status_code=400)
+    if vt <= 0:
+        return JSONResponse({"error": "vt must be a positive number"}, status_code=400)
+
+    job_id = uuid.uuid4().hex
+    job = {
+        "job_id": job_id,
+        "status": "pending",
+        "request": {"date": date, "vt": vt},
+        "result": None,
+        "error": None,
+        "created_at": _now_iso(),
+        "completed_at": None,
+    }
+    _store_job(job)
+
+    task = asyncio.create_task(_process_hedge_job(job_id, date, vt))
+    _HEDGE_BG_TASKS.add(task)
+    task.add_done_callback(_HEDGE_BG_TASKS.discard)
+
+    return JSONResponse(
+        {
+            "job_id": job_id,
+            "status": "pending",
+            "request": job["request"],
+            "poll_url": f"/api/hedge/{job_id}",
+        },
+        status_code=202,
+    )
+
+
+@mcp.custom_route("/api/hedge/{job_id}", methods=["GET"])
+async def get_hedge_job(request: Request) -> JSONResponse:
+    """Poll an async hedge-signal job. 202 while pending/running; 200 when done/error."""
+    job_id = request.path_params.get("job_id")
+    job = _HEDGE_JOBS.get(job_id)
+    if job is None:
+        return JSONResponse({"error": "unknown job_id", "job_id": job_id}, status_code=404)
+
+    resp = {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "request": job["request"],
+        "created_at": job["created_at"],
+        "completed_at": job["completed_at"],
+    }
+    if job["status"] == "done":
+        resp["result"] = job["result"]
+    elif job["status"] == "error":
+        resp["error"] = job["error"]
+
+    code = 200 if job["status"] in ("done", "error") else 202
+    return JSONResponse(resp, status_code=code)
 
 
 # ===========================================================================
