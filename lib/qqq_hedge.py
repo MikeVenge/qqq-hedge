@@ -21,8 +21,9 @@ Two multiplicative layers:
       written in the source document.
 
   Layer 2 — inverse-vol scalar (magnitude):
-      w_vol = min( target_vol / rv20(t-1), 1.50 )
-      rv20  = trailing 20-day realized vol of QQQ, annualized (x sqrt(252))
+      w_vol = min( target_vol / rv20, 1.50 )
+      rv20  = trailing 20-day realized vol of QQQ THROUGH date t (most recent
+              close included), annualized (x sqrt(252)) from daily LOG returns
       target_vol = vt / 100   (e.g. vt=15 -> VT15 -> 0.15)
 
   Combined:
@@ -122,21 +123,27 @@ def compute_exposure_indicators(
 
     Returns DataFrame with columns: sma_fast, sma_slow, rv20.
       - sma_fast / sma_slow : simple moving averages (default 100 / 200)
-      - rv20                : trailing 20d realized vol, annualized, LAGGED one
-                              day (the value known as of the prior close, per
-                              the model's sigma_realized(t-1) convention).
+      - rv20                : trailing 20d realized vol through date t -- the most
+                              recent close IS included -- annualized x sqrt(252),
+                              computed from daily LOG returns ln(P_t / P_{t-1})
+                              (sample std, ddof=1).
+                              No look-ahead: the as-of-t signal uses only data
+                              known at the close of t. Backtest look-ahead is
+                              handled separately by lagging the position one day
+                              (see backtest()), so the vol is NOT lagged here.
+
+    The `returns` argument is accepted for API compatibility but is not used for
+    the vol estimate (which is derived from log returns of `close`).
     """
     cfg = config or VolTargetConfig()
-    if returns is None:
-        returns = close.pct_change()
-    returns = returns.reindex(close.index)
 
     sma_fast = close.rolling(cfg.sma_fast, min_periods=cfg.sma_fast).mean()
     sma_slow = close.rolling(cfg.sma_slow, min_periods=cfg.sma_slow).mean()
 
-    rv = returns.rolling(cfg.vol_window, min_periods=cfg.vol_window).std(ddof=1)
-    rv = rv * np.sqrt(cfg.annualization)
-    rv20 = rv.shift(1)  # use vol realized through t-1 to size position at t
+    # Realized vol from LOG returns of close (time-additive; standard for vol).
+    log_ret = np.log(close / close.shift(1))
+    rv20 = log_ret.rolling(cfg.vol_window, min_periods=cfg.vol_window).std(ddof=1)
+    rv20 = rv20 * np.sqrt(cfg.annualization)
 
     return pd.DataFrame(
         {"sma_fast": sma_fast, "sma_slow": sma_slow, "rv20": rv20},

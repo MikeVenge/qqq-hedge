@@ -82,6 +82,26 @@ def test_confirm_changes_are_fewer_than_instantaneous():
     assert flips3 <= flips1
 
 
+def test_rv20_is_log_returns_same_day():
+    """rv20 at date t = trailing-20 vol of LOG returns THROUGH t (most recent
+    close included), annualized -- not simple returns, and not lagged to t-1."""
+    rng = np.random.default_rng(9)
+    dates = pd.bdate_range("2019-01-01", periods=300)
+    rets = pd.Series(rng.normal(0.0004, 0.013, 300), index=dates)
+    close = (1 + rets).cumprod() * 300
+    df = QQQVolTargetSignal.from_series(close, rets, VolTargetConfig.from_vt(15))
+
+    log_ret = np.log(close / close.shift(1))
+    expected_log_t = log_ret.iloc[-20:].std(ddof=1) * np.sqrt(252)   # log, through t
+    lagged_log_t1 = log_ret.iloc[-21:-1].std(ddof=1) * np.sqrt(252)  # log, through t-1
+    simple_t = close.pct_change().iloc[-20:].std(ddof=1) * np.sqrt(252)
+
+    got = df["rv20"].iloc[-1]
+    assert abs(got - expected_log_t) < 1e-12, "rv20 should be log-return vol through t"
+    assert abs(got - lagged_log_t1) > 1e-9, "rv20 must not be lagged to t-1"
+    assert abs(got - simple_t) > 1e-9, "rv20 must use log returns, not simple returns"
+
+
 def test_hedge_parameters_reconciles():
     rng = np.random.default_rng(3)
     dates = pd.bdate_range("2019-01-01", periods=600)
