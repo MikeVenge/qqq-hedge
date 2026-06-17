@@ -269,11 +269,20 @@ def gate_factor(
 # ===========================================================================
 
 
-def _compute_hedge_signal(date: str | None = None, vt: float = 15) -> dict:
+def _compute_hedge_signal(
+    date: str | None = None,
+    vt: float = 15,
+    book_id: int | None = None,
+) -> dict:
     """Shared core for the QQQ hedge signal (used by the MCP tool and REST API).
 
-    Blocking (Alpha Vantage fetch + pandas); call via a threadpool from async
-    contexts. Returns the hedging-parameters dict, or {"error": ...}.
+    Blocking (Alpha Vantage fetch + pandas + optional Mango call); call via a
+    threadpool from async contexts. Returns the hedging-parameters dict, or
+    {"error": ...}.
+
+    When `book_id` is set, the inverse-vol scalar uses the 30-day realized
+    volatility of that Mango book's current portfolio instead of QQQ's; the SMA
+    regime gate still uses QQQ.
     """
     from lib.data import load_ohlcv_alphavantage
     from lib.qqq_hedge import hedge_parameters
@@ -281,16 +290,47 @@ def _compute_hedge_signal(date: str | None = None, vt: float = 15) -> dict:
     ohlcv = load_ohlcv_alphavantage(["QQQ"], start="2019-01-01")
     if ohlcv is None:
         return {"error": "Could not load QQQ data from Alpha Vantage"}
-
     close = ohlcv["close"]["QQQ"]
     returns = ohlcv["returns"]["QQQ"]
-    return hedge_parameters(close, returns, as_of=date, vt=vt)
+
+    if book_id is None:
+        return hedge_parameters(close, returns, as_of=date, vt=vt)
+
+    # --- Book portfolio-vol path ---
+    from lib.mango import resolve_book_constituents
+    from lib.portfolio_vol import portfolio_realized_vol_asof
+
+    book = resolve_book_constituents(int(book_id))
+    if "error" in book:
+        return {"error": f"book {book_id}: {book['error']}"}
+    if not book["symbols"]:
+        return {"error": f"book {book_id}: no priced constituents"}
+
+    panel = load_ohlcv_alphavantage(book["symbols"], start="2019-01-01")
+    if panel is None:
+        return {"error": "Could not load book constituent prices from Alpha Vantage"}
+
+    volinfo = portfolio_realized_vol_asof(
+        panel["returns"], book["weights"], as_of=date, window=30
+    )
+    if "error" in volinfo:
+        return {"error": f"book {book_id} vol: {volinfo['error']}"}
+
+    return hedge_parameters(
+        close, returns, as_of=date, vt=vt,
+        rv_override=volinfo["portfolio_vol"], vol_source="portfolio",
+        book_meta={
+            "book_id": book["book_id"], "book_name": book["book_name"],
+            "n_constituents": book["n_constituents"],
+        },
+    )
 
 
 @mcp.tool()
 def qqq_hedge_signal(
     date: str | None = None,
     vt: float = 15,
+    book_id: int | None = None,
 ) -> dict:
     """Get the QQQ hedging parameters as of a date for a chosen vol-target level.
 
@@ -304,9 +344,12 @@ def qqq_hedge_signal(
               recent trading day on/before it. Omit for the latest trading day.
         vt: Vol-target level (any positive number). 15 -> VT15 -> target_vol 0.15;
             23 -> VT23 -> target_vol 0.23. Default 15.
+        book_id: Optional Mango trading-book ID. When set, the inverse-vol scalar
+            uses the book's 30-day realized portfolio volatility instead of QQQ's
+            (the SMA regime gate still uses QQQ).
     """
     try:
-        return _compute_hedge_signal(date, vt)
+        return _compute_hedge_signal(date, vt, book_id)
     except Exception as e:
         logger.error(f"qqq_hedge_signal failed: {traceback.format_exc()}")
         return {"error": str(e)}
@@ -590,14 +633,16 @@ def _store_job(job: dict) -> None:
         _HEDGE_JOBS.popitem(last=False)
 
 
-async def _process_hedge_job(job_id: str, date: str | None, vt: float) -> None:
+async def _process_hedge_job(
+    job_id: str, date: str | None, vt: float, book_id: int | None = None
+) -> None:
     job = _HEDGE_JOBS.get(job_id)
     if job is None:
         return
     job["status"] = "running"
     try:
         # Offload the blocking fetch + compute so the event loop stays free.
-        result = await asyncio.to_thread(_compute_hedge_signal, date, vt)
+        result = await asyncio.to_thread(_compute_hedge_signal, date, vt, book_id)
         if isinstance(result, dict) and "error" in result:
             job["status"] = "error"
             job["error"] = result["error"]
@@ -633,11 +678,19 @@ async def submit_hedge_job(request: Request) -> JSONResponse:
     if vt <= 0:
         return JSONResponse({"error": "vt must be a positive number"}, status_code=400)
 
+    book_id_raw = body.get("book_id", request.query_params.get("book_id"))
+    book_id = None
+    if book_id_raw not in (None, ""):
+        try:
+            book_id = int(book_id_raw)
+        except (TypeError, ValueError):
+            return JSONResponse({"error": f"invalid book_id: {book_id_raw!r}"}, status_code=400)
+
     job_id = uuid.uuid4().hex
     job = {
         "job_id": job_id,
         "status": "pending",
-        "request": {"date": date, "vt": vt},
+        "request": {"date": date, "vt": vt, "book_id": book_id},
         "result": None,
         "error": None,
         "created_at": _now_iso(),
@@ -645,7 +698,7 @@ async def submit_hedge_job(request: Request) -> JSONResponse:
     }
     _store_job(job)
 
-    task = asyncio.create_task(_process_hedge_job(job_id, date, vt))
+    task = asyncio.create_task(_process_hedge_job(job_id, date, vt, book_id))
     _HEDGE_BG_TASKS.add(task)
     task.add_done_callback(_HEDGE_BG_TASKS.discard)
 

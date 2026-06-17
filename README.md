@@ -54,12 +54,17 @@ Content-Type: application/json
 { "date": "2026-05-28", "vt": 23 }
 ```
 
-Both fields are **optional**:
+All fields are **optional**:
 - `date` — ISO `YYYY-MM-DD`. Omit (or `null`) for the latest trading day. A
   non-trading day rolls back to the most recent trading day on/before it.
 - `vt` — vol-target level, any positive number. Default `15`.
+- `book_id` — a Mango trading-book ID (integer). When set, the inverse-vol
+  scalar uses the book's **30-day realized portfolio volatility** instead of
+  QQQ's; the SMA regime gate still uses QQQ. The response adds
+  `vol_source:"portfolio"`, `portfolio_vol`, `book_name`, `n_constituents`.
+  (Slower: the server fetches each constituent's prices — use the async poll.)
 
-You may also pass them as query params: `POST /api/hedge?date=2026-05-28&vt=23`.
+You may also pass them as query params: `POST /api/hedge?date=2026-05-28&vt=23&book_id=31`.
 
 **Response — `202 Accepted`:**
 
@@ -212,9 +217,10 @@ print(get_hedge(date="2026-05-28", vt=23))   # latest if date=None
 
 ### Tools
 
-**`qqq_hedge_signal(date: str | None = None, vt: float = 15) -> dict`**
+**`qqq_hedge_signal(date: str | None = None, vt: float = 15, book_id: int | None = None) -> dict`**
 Same inputs and same `result` object as the REST API (returned synchronously,
-not as a job).
+not as a job). With `book_id`, the vol input becomes the Mango book's 30-day
+portfolio volatility (gate stays on QQQ).
 
 **`qqq_hedge_backtest(start="2020-01-01", end="2026-12-31", vt=15, leverage_cap=1.5, fed_funds_rate=0.0) -> dict`**
 Backtests the overlay vs buy-and-hold. Returns `stats` (Sharpe, max drawdown,

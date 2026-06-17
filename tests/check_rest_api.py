@@ -152,6 +152,35 @@ def check_error_date_before_data():
     assert "error" in job and job["error"], job
 
 
+def check_book_vol_signal():
+    """book_id -> portfolio vol source; gate must still match the QQQ signal."""
+    code, sub = http("POST", "/api/hedge", {"book_id": 31, "vt": 15})
+    assert code == 202, f"{code}: {sub}"
+    jid = sub["job_id"]
+    job = None
+    for _ in range(75):          # book path does N+1 AV calls -> allow ~150s
+        c, job = http("GET", f"/api/hedge/{jid}")
+        if job.get("status") in ("done", "error"):
+            break
+        time.sleep(2)
+    assert job["status"] == "done", job
+    r = job["result"]
+    assert r["vol_source"] == "portfolio", r
+    assert r.get("portfolio_vol", 0) > 0, r
+    assert r.get("book_name"), r
+    assert r.get("n_constituents", 0) > 0, r
+    assert abs(r["exposure"] - r["gate"] * r["w_vol"]) < 1e-6, r
+    assert abs(r["w_vol"] - min(15 / 100 / r["rv20"], 1.5)) < 1e-3, r
+    # Decoupling: the gate must equal the plain QQQ signal for the same date.
+    _, qjob = submit_and_wait({"date": r["as_of_date"], "vt": 15})
+    assert qjob["result"]["gate"] == r["gate"], "book gate must match QQQ gate"
+
+
+def check_book_unknown():
+    _, job = submit_and_wait({"book_id": 99999999, "vt": 15})
+    assert job["status"] == "error", job
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -166,6 +195,8 @@ CHECKS = [
     check_error_nonpositive_vt,
     check_error_unknown_job,
     check_error_date_before_data,
+    check_book_vol_signal,
+    check_book_unknown,
 ]
 
 

@@ -112,6 +112,30 @@ def test_hedge_parameters_reconciles():
     assert 0.0 <= p["exposure"] <= 1.5
     assert abs(p["exposure"] - p["gate"] * p["w_vol"]) < 1e-6
     assert p["gate"] in (0.0, 0.5, 1.0)
+    assert p["vol_source"] == "qqq"           # default unchanged
+    assert "portfolio_vol" not in p
+
+
+def test_rv_override_decouples_vol_from_gate():
+    """rv_override replaces the vol input; the SMA gate must stay on QQQ."""
+    rng = np.random.default_rng(3)
+    dates = pd.bdate_range("2019-01-01", periods=600)
+    rets = pd.Series(rng.normal(0.0004, 0.013, 600), index=dates)
+    close = (1 + rets).cumprod() * 300
+
+    base = hedge_parameters(close, rets, as_of=None, vt=15)
+    over = hedge_parameters(close, rets, as_of=None, vt=15, rv_override=0.20,
+                            vol_source="portfolio",
+                            book_meta={"book_id": 99, "book_name": "B", "n_constituents": 7})
+
+    # gate identical (decoupling proof) but vol/exposure driven by the override
+    assert over["gate"] == base["gate"]
+    assert abs(over["rv20"] - 0.20) < 1e-9
+    assert abs(over["w_vol"] - min(0.15 / 0.20, 1.5)) < 1e-9
+    assert abs(over["exposure"] - over["gate"] * over["w_vol"]) < 1e-9
+    assert over["vol_source"] == "portfolio"
+    assert over["portfolio_vol"] == over["rv20"]
+    assert over["book_id"] == 99 and over["n_constituents"] == 7
 
 
 if __name__ == "__main__":

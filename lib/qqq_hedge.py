@@ -228,8 +228,13 @@ class QQQVolTargetSignal:
         close: pd.Series,
         returns: Optional[pd.Series] = None,
         config: Optional[VolTargetConfig] = None,
+        rv_override: Optional[float] = None,
     ) -> pd.DataFrame:
         """Vectorized exposure for an entire price series.
+
+        If `rv_override` is given, it replaces QQQ's rv20 in the w_vol scalar
+        (used for the book-portfolio vol option); the SMA gate is still derived
+        from `close` (QQQ), so only the magnitude layer changes.
 
         Returns DataFrame (same index as close) with columns:
             gate, w_vol, exposure, cash, leverage_capped,
@@ -246,6 +251,9 @@ class QQQVolTargetSignal:
         sma_fast = ind["sma_fast"]
         sma_slow = ind["sma_slow"]
         rv20 = ind["rv20"]
+        if rv_override is not None:
+            # Replace QQQ vol with a precomputed scalar (e.g. book portfolio vol).
+            rv20 = pd.Series(float(rv_override), index=close.index)
 
         cd = max(1, int(cfg.confirm_days))
         above_fast = cls._debounced_above(close, sma_fast, cd)
@@ -375,6 +383,9 @@ def hedge_parameters(
     as_of: Optional[str] = None,
     vt: float = 15.0,
     config: Optional[VolTargetConfig] = None,
+    rv_override: Optional[float] = None,
+    vol_source: str = "qqq",
+    book_meta: Optional[dict] = None,
 ) -> dict:
     """Compute the QQQ hedging parameters as of a date for a given vt level.
 
@@ -384,6 +395,10 @@ def hedge_parameters(
         as_of: ISO date string; rolls back to the most recent trading day on or
                before it. None -> latest available trading day.
         vt: vol-target level (15 -> VT15 -> target_vol 0.15). Any positive number.
+        rv_override: if set, replaces QQQ's rv20 in w_vol (book portfolio vol).
+                     The SMA gate still uses QQQ `close`.
+        vol_source: "qqq" (default) or "portfolio"; labels the output.
+        book_meta: optional {book_id, book_name, n_constituents} for the output.
 
     Returns a dict of hedging parameters, or {"error": ...} on failure.
     """
@@ -391,7 +406,7 @@ def hedge_parameters(
         config = VolTargetConfig.from_vt(vt)
     config.validate()
 
-    df = QQQVolTargetSignal.from_series(close, returns, config)
+    df = QQQVolTargetSignal.from_series(close, returns, config, rv_override=rv_override)
 
     if as_of is None:
         target = df.index[-1]
@@ -419,7 +434,7 @@ def hedge_parameters(
         f"{cash * 100:.1f}% cash" if cash >= 0 else f"{abs(cash) * 100:.1f}% leverage"
     )
 
-    return {
+    out = {
         "as_of_date": str(target.date()),
         "requested_date": str(pd.Timestamp(as_of).date()) if as_of else str(target.date()),
         "vt": float(vt),
@@ -437,4 +452,14 @@ def hedge_parameters(
         "close": round(float(row["close"]), 2),
         "sma100": round(float(row["sma_fast"]), 2),
         "sma200": round(float(row["sma_slow"]), 2),
+        "vol_source": vol_source,
     }
+    if vol_source == "portfolio":
+        # rv20 carries the book's portfolio vol; surface it under a clear name too.
+        out["portfolio_vol"] = round(float(row["rv20"]), 4)
+        out["portfolio_vol_pct"] = f"{float(row['rv20']) * 100:.1f}%"
+        if book_meta:
+            out["book_id"] = book_meta.get("book_id")
+            out["book_name"] = book_meta.get("book_name")
+            out["n_constituents"] = book_meta.get("n_constituents")
+    return out
