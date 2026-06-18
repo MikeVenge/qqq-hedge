@@ -322,6 +322,8 @@ def _compute_hedge_signal(
         book_meta={
             "book_id": book["book_id"], "book_name": book["book_name"],
             "n_constituents": book["n_constituents"],
+            "excluded_cash": book.get("dropped_cash") or None,
+            "excluded_cash_weight": book.get("cash_weight") or None,
         },
     )
 

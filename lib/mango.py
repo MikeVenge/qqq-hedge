@@ -43,6 +43,23 @@ def _max_constituents() -> int:
         return 60
 
 
+# Cash / T-bill / money-market holdings: excluded from the risk basket when
+# computing portfolio volatility (they are cash, not risk -- counting them
+# deflates the vol and over-deploys the hedge). Extend via env CASH_TICKERS
+# (comma-separated). The hedge manages its own cash sleeve separately.
+_CASH_EQUIVALENTS = frozenset({
+    "BIL", "BILS", "SGOV", "SHV", "USFR", "TBIL", "GBIL", "ICSH", "CLIP",
+    "XHLF", "TFLO", "CSHI", "BILZ", "OBIL", "JPST", "MINT", "NEAR", "GSY",
+    "CASH", "USD",
+})
+
+
+def _cash_tickers() -> frozenset:
+    extra = os.environ.get("CASH_TICKERS", "")
+    extras = {t.strip().upper() for t in extra.split(",") if t.strip()}
+    return _CASH_EQUIVALENTS | extras
+
+
 def _parse_rpc(raw: str) -> dict:
     """Parse a JSON-RPC response that may be plain JSON or SSE-framed."""
     raw = raw.strip()
@@ -116,22 +133,27 @@ def _constituents_from_positions(
     book_id: int,
     *,
     include_options: bool = False,
+    include_cash: bool = False,
     max_constituents: int | None = None,
 ) -> dict:
     """Pure: turn a `list_positions` payload into signed, normalized weights.
 
     - keep `quantity != 0` (active); drop `asset_class == 'option'` unless asked
+    - drop cash/T-bill/MMF holdings (see _cash_tickers) unless include_cash --
+      they are cash, not risk; including them deflates the portfolio vol
     - magnitude = weight_of_gross/100 (percent; falls back to |market_value| share)
     - sign: 'S' / negative quantity -> short (negative weight)
     - aggregate duplicate symbols, cap to top `max_constituents` by |weight|,
-      then renormalize so sum(|w|) == 1 (vol per unit of gross capital)
+      then renormalize so sum(|w|) == 1 (vol per unit of risk capital)
 
     Returns {book_id, book_name, symbols, weights, n_constituents,
-    n_dropped_options, n_truncated, gross_market_value, net_exposure} or {error}.
+    n_dropped_options, n_dropped_cash, dropped_cash, cash_weight, n_truncated,
+    gross_market_value, net_exposure} or {error}.
     """
     if max_constituents is None:
         max_constituents = _max_constituents()
     positions = data.get("positions") or []
+    cash_set = _cash_tickers()
 
     book_name = None
     active = []
@@ -164,6 +186,7 @@ def _constituents_from_positions(
     mv_total = sum(abs(_f(p.get("market_value"))) for p in active) or 1.0
 
     weights: dict[str, float] = {}
+    dropped_cash: dict[str, float] = {}   # symbol -> |weight| as fraction of gross
     for p in active:
         sym = str(p.get("symbol") or "").upper()
         if not sym:
@@ -171,11 +194,19 @@ def _constituents_from_positions(
         mag = abs(_f(p.get("weight_of_gross"))) / 100.0 if have_wog \
             else abs(_f(p.get("market_value"))) / mv_total
         is_short = (str(p.get("long_short")).upper() == "S") or (_f(p.get("quantity")) < 0)
+        if not include_cash and sym in cash_set:
+            dropped_cash[sym] = dropped_cash.get(sym, 0.0) + mag
+            continue
         weights[sym] = weights.get(sym, 0.0) + (-mag if is_short else mag)
 
     weights = {k: v for k, v in weights.items() if v != 0.0}
     if not weights:
-        return {"error": f"book {book_id}: all constituent weights are zero"}
+        return {
+            "error": (
+                f"book {book_id}: no risk constituents after excluding cash "
+                f"{sorted(dropped_cash)} ({sum(dropped_cash.values()) * 100:.0f}% of gross)"
+            )
+        }
 
     n_truncated = 0
     if len(weights) > max_constituents:
@@ -193,6 +224,9 @@ def _constituents_from_positions(
         "weights": weights,
         "n_constituents": len(weights),
         "n_dropped_options": n_dropped_options,
+        "n_dropped_cash": len(dropped_cash),
+        "dropped_cash": sorted(dropped_cash.keys()),
+        "cash_weight": round(sum(dropped_cash.values()), 4),
         "n_truncated": n_truncated,
         "gross_market_value": mv_total,
         "net_exposure": round(sum(weights.values()), 6),
@@ -203,11 +237,13 @@ def resolve_book_constituents(
     book_id: int,
     *,
     include_options: bool = False,
+    include_cash: bool = False,
     max_constituents: int | None = None,
     timeout: float = _DEFAULT_TIMEOUT,
 ) -> dict:
     """Fetch a book and resolve it to signed, normalized constituents+weights."""
     data = list_positions(book_id, timeout=timeout)
     return _constituents_from_positions(
-        data, book_id, include_options=include_options, max_constituents=max_constituents
+        data, book_id, include_options=include_options,
+        include_cash=include_cash, max_constituents=max_constituents,
     )

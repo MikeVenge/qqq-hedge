@@ -57,6 +57,29 @@ def test_constituents_empty_book():
     assert "error" in r
 
 
+def test_constituents_drops_cash():
+    """Cash/T-bill ETFs (e.g. BIL) are excluded from the risk basket and the
+    remaining risk weights are renormalized."""
+    payload = {"positions": [
+        {"symbol": "AAA", "quantity": 1, "market_value": "500",
+         "weight_of_gross": "50", "asset_class": "equity", "long_short": "L"},
+        {"symbol": "BBB", "quantity": 1, "market_value": "300",
+         "weight_of_gross": "30", "asset_class": "equity", "long_short": "L"},
+        {"symbol": "BIL", "quantity": 1, "market_value": "200",
+         "weight_of_gross": "20", "asset_class": "equity", "long_short": "L"},
+    ]}
+    r = _constituents_from_positions(payload, book_id=132)
+    assert r["symbols"] == ["AAA", "BBB"], r        # BIL dropped
+    assert r["dropped_cash"] == ["BIL"]
+    assert abs(r["cash_weight"] - 0.20) < 1e-9      # 20% of gross was cash
+    # risk weights renormalized over AAA(0.5)+BBB(0.3) -> 0.625 / 0.375
+    assert abs(r["weights"]["AAA"] - 0.625) < 1e-9
+    assert abs(r["weights"]["BBB"] - 0.375) < 1e-9
+    # include_cash=True keeps it
+    r2 = _constituents_from_positions(payload, book_id=132, include_cash=True)
+    assert "BIL" in r2["symbols"]
+
+
 def test_constituents_market_value_fallback():
     # No weight_of_gross -> derive from |market_value|
     payload = {"positions": [

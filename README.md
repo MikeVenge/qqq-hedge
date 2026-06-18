@@ -62,7 +62,11 @@ All fields are **optional**:
   scalar uses the book's **30-day realized portfolio volatility** instead of
   QQQ's; the SMA regime gate still uses QQQ. The response adds
   `vol_source:"portfolio"`, `portfolio_vol`, `book_name`, `n_constituents`.
-  (Slower: the server fetches each constituent's prices — use the async poll.)
+  Cash / T-bill / money-market holdings (BIL, SGOV, SHV, …) are **excluded**
+  from the vol basket and the risk weights renormalized — otherwise a cash slug
+  would deflate the vol and over-deploy the hedge; any excluded names are
+  reported as `excluded_cash` / `excluded_cash_weight`. (Slower: the server
+  fetches each constituent's prices — use the async poll.)
 
 You may also pass them as query params: `POST /api/hedge?date=2026-05-28&vt=23&book_id=31`.
 
