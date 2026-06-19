@@ -134,6 +134,7 @@ def _constituents_from_positions(
     *,
     include_options: bool = False,
     include_cash: bool = False,
+    weighting: str = "equal",
     max_constituents: int | None = None,
 ) -> dict:
     """Pure: turn a `list_positions` payload into signed, normalized weights.
@@ -141,17 +142,19 @@ def _constituents_from_positions(
     - keep `quantity != 0` (active); drop `asset_class == 'option'` unless asked
     - drop cash/T-bill/MMF holdings (see _cash_tickers) unless include_cash --
       they are cash, not risk; including them deflates the portfolio vol
-    - magnitude = weight_of_gross/100 (percent; falls back to |market_value| share)
     - sign: 'S' / negative quantity -> short (negative weight)
-    - aggregate duplicate symbols, cap to top `max_constituents` by |weight|,
-      then renormalize so sum(|w|) == 1 (vol per unit of risk capital)
+    - aggregate duplicate symbols, cap to top `max_constituents` by gross |weight|
+    - `weighting`: "equal" (default) -> each risk name gets +/- 1/N;
+      "gross" -> weight_of_gross/100 (falls back to |market_value| share),
+      renormalized so sum(|w|) == 1 (vol per unit of risk capital)
 
-    Returns {book_id, book_name, symbols, weights, n_constituents,
+    Returns {book_id, book_name, symbols, weights, weighting, n_constituents,
     n_dropped_options, n_dropped_cash, dropped_cash, cash_weight, n_truncated,
     gross_market_value, net_exposure} or {error}.
     """
     if max_constituents is None:
         max_constituents = _max_constituents()
+    weighting = weighting if weighting in ("equal", "gross") else "equal"
     positions = data.get("positions") or []
     cash_set = _cash_tickers()
 
@@ -214,14 +217,19 @@ def _constituents_from_positions(
         n_truncated = len(weights) - max_constituents
         weights = dict(top)
 
-    gross = sum(abs(w) for w in weights.values()) or 1.0
-    weights = {k: v / gross for k, v in weights.items()}
+    if weighting == "equal":
+        n = len(weights)
+        weights = {k: (1.0 / n if v > 0 else -1.0 / n) for k, v in weights.items()}
+    else:  # "gross"
+        gross = sum(abs(w) for w in weights.values()) or 1.0
+        weights = {k: v / gross for k, v in weights.items()}
 
     return {
         "book_id": int(book_id),
         "book_name": book_name,
         "symbols": sorted(weights.keys()),
         "weights": weights,
+        "weighting": weighting,
         "n_constituents": len(weights),
         "n_dropped_options": n_dropped_options,
         "n_dropped_cash": len(dropped_cash),
@@ -238,6 +246,7 @@ def resolve_book_constituents(
     *,
     include_options: bool = False,
     include_cash: bool = False,
+    weighting: str = "equal",
     max_constituents: int | None = None,
     timeout: float = _DEFAULT_TIMEOUT,
 ) -> dict:
@@ -245,5 +254,6 @@ def resolve_book_constituents(
     data = list_positions(book_id, timeout=timeout)
     return _constituents_from_positions(
         data, book_id, include_options=include_options,
-        include_cash=include_cash, max_constituents=max_constituents,
+        include_cash=include_cash, weighting=weighting,
+        max_constituents=max_constituents,
     )

@@ -36,12 +36,13 @@ def _payload():
     }
 
 
-def test_constituents_parsing():
-    r = _constituents_from_positions(_payload(), book_id=99)
+def test_constituents_parsing_gross():
+    r = _constituents_from_positions(_payload(), book_id=99, weighting="gross")
     assert "error" not in r, r
     assert r["book_name"] == "Test Book"
     assert r["symbols"] == ["AAA", "BBB", "CCC"]          # option + closed dropped
     assert r["n_dropped_options"] == 1
+    assert r["weighting"] == "gross"
     w = r["weights"]
     # AAA duplicated (25+25=50%), BBB 30%, CCC -20%; gross 100% -> normalized
     assert abs(w["AAA"] - 0.5) < 1e-9
@@ -49,6 +50,18 @@ def test_constituents_parsing():
     assert abs(w["CCC"] - (-0.2)) < 1e-9               # short -> negative
     assert abs(sum(abs(v) for v in w.values()) - 1.0) < 1e-9
     assert abs(r["net_exposure"] - 0.6) < 1e-9
+
+
+def test_constituents_equal_weight_default():
+    """Default weighting is equal: each risk name +/- 1/N (signed by long/short)."""
+    r = _constituents_from_positions(_payload(), book_id=99)
+    assert r["weighting"] == "equal"
+    w = r["weights"]
+    assert r["symbols"] == ["AAA", "BBB", "CCC"]
+    assert abs(w["AAA"] - 1/3) < 1e-9
+    assert abs(w["BBB"] - 1/3) < 1e-9
+    assert abs(w["CCC"] - (-1/3)) < 1e-9               # short stays negative
+    assert abs(sum(abs(v) for v in w.values()) - 1.0) < 1e-9
 
 
 def test_constituents_empty_book():
@@ -68,13 +81,18 @@ def test_constituents_drops_cash():
         {"symbol": "BIL", "quantity": 1, "market_value": "200",
          "weight_of_gross": "20", "asset_class": "equity", "long_short": "L"},
     ]}
-    r = _constituents_from_positions(payload, book_id=132)
+    # gross weighting: renormalized over AAA(0.5)+BBB(0.3) -> 0.625 / 0.375
+    r = _constituents_from_positions(payload, book_id=132, weighting="gross")
     assert r["symbols"] == ["AAA", "BBB"], r        # BIL dropped
     assert r["dropped_cash"] == ["BIL"]
     assert abs(r["cash_weight"] - 0.20) < 1e-9      # 20% of gross was cash
-    # risk weights renormalized over AAA(0.5)+BBB(0.3) -> 0.625 / 0.375
     assert abs(r["weights"]["AAA"] - 0.625) < 1e-9
     assert abs(r["weights"]["BBB"] - 0.375) < 1e-9
+    # equal weighting (default): the two risk names -> 0.5 / 0.5
+    re = _constituents_from_positions(payload, book_id=132)
+    assert abs(re["weights"]["AAA"] - 0.5) < 1e-9
+    assert abs(re["weights"]["BBB"] - 0.5) < 1e-9
+    assert re["dropped_cash"] == ["BIL"]            # cash still excluded
     # include_cash=True keeps it
     r2 = _constituents_from_positions(payload, book_id=132, include_cash=True)
     assert "BIL" in r2["symbols"]
@@ -86,7 +104,7 @@ def test_constituents_market_value_fallback():
         {"symbol": "AAA", "quantity": 1, "market_value": "300", "asset_class": "equity"},
         {"symbol": "BBB", "quantity": 1, "market_value": "100", "asset_class": "equity"},
     ]}
-    r = _constituents_from_positions(payload, book_id=2)
+    r = _constituents_from_positions(payload, book_id=2, weighting="gross")
     assert abs(r["weights"]["AAA"] - 0.75) < 1e-9
     assert abs(r["weights"]["BBB"] - 0.25) < 1e-9
 

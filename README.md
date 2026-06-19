@@ -67,6 +67,9 @@ All fields are **optional**:
   would deflate the vol and over-deploy the hedge; any excluded names are
   reported as `excluded_cash` / `excluded_cash_weight`. (Slower: the server
   fetches each constituent's prices — use the async poll.)
+- `weighting` — how book constituents are weighted for the vol: `"equal"`
+  (default; each risk name 1/N) or `"gross"` (market-value `weight_of_gross`).
+  Reported back as `weighting` in the result.
 
 You may also pass them as query params: `POST /api/hedge?date=2026-05-28&vt=23&book_id=31`.
 

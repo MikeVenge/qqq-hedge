@@ -462,6 +462,8 @@ def hedge_parameters(
             out["book_id"] = book_meta.get("book_id")
             out["book_name"] = book_meta.get("book_name")
             out["n_constituents"] = book_meta.get("n_constituents")
+            if book_meta.get("weighting"):
+                out["weighting"] = book_meta["weighting"]
             if book_meta.get("excluded_cash"):
                 out["excluded_cash"] = book_meta["excluded_cash"]
                 out["excluded_cash_weight"] = book_meta.get("excluded_cash_weight")

@@ -273,6 +273,7 @@ def _compute_hedge_signal(
     date: str | None = None,
     vt: float = 15,
     book_id: int | None = None,
+    weighting: str = "equal",
 ) -> dict:
     """Shared core for the QQQ hedge signal (used by the MCP tool and REST API).
 
@@ -300,7 +301,7 @@ def _compute_hedge_signal(
     from lib.mango import resolve_book_constituents
     from lib.portfolio_vol import portfolio_realized_vol_asof
 
-    book = resolve_book_constituents(int(book_id))
+    book = resolve_book_constituents(int(book_id), weighting=weighting)
     if "error" in book:
         return {"error": f"book {book_id}: {book['error']}"}
     if not book["symbols"]:
@@ -322,6 +323,7 @@ def _compute_hedge_signal(
         book_meta={
             "book_id": book["book_id"], "book_name": book["book_name"],
             "n_constituents": book["n_constituents"],
+            "weighting": book.get("weighting"),
             "excluded_cash": book.get("dropped_cash") or None,
             "excluded_cash_weight": book.get("cash_weight") or None,
         },
@@ -333,6 +335,7 @@ def qqq_hedge_signal(
     date: str | None = None,
     vt: float = 15,
     book_id: int | None = None,
+    weighting: str = "equal",
 ) -> dict:
     """Get the QQQ hedging parameters as of a date for a chosen vol-target level.
 
@@ -348,10 +351,12 @@ def qqq_hedge_signal(
             23 -> VT23 -> target_vol 0.23. Default 15.
         book_id: Optional Mango trading-book ID. When set, the inverse-vol scalar
             uses the book's 30-day realized portfolio volatility instead of QQQ's
-            (the SMA regime gate still uses QQQ).
+            (the SMA regime gate still uses QQQ). Cash/T-bill holdings are excluded.
+        weighting: How constituents are weighted for the book vol: "equal"
+            (default; each risk name 1/N) or "gross" (market-value weight_of_gross).
     """
     try:
-        return _compute_hedge_signal(date, vt, book_id)
+        return _compute_hedge_signal(date, vt, book_id, weighting)
     except Exception as e:
         logger.error(f"qqq_hedge_signal failed: {traceback.format_exc()}")
         return {"error": str(e)}
@@ -636,7 +641,8 @@ def _store_job(job: dict) -> None:
 
 
 async def _process_hedge_job(
-    job_id: str, date: str | None, vt: float, book_id: int | None = None
+    job_id: str, date: str | None, vt: float,
+    book_id: int | None = None, weighting: str = "equal",
 ) -> None:
     job = _HEDGE_JOBS.get(job_id)
     if job is None:
@@ -644,7 +650,7 @@ async def _process_hedge_job(
     job["status"] = "running"
     try:
         # Offload the blocking fetch + compute so the event loop stays free.
-        result = await asyncio.to_thread(_compute_hedge_signal, date, vt, book_id)
+        result = await asyncio.to_thread(_compute_hedge_signal, date, vt, book_id, weighting)
         if isinstance(result, dict) and "error" in result:
             job["status"] = "error"
             job["error"] = result["error"]
@@ -688,11 +694,15 @@ async def submit_hedge_job(request: Request) -> JSONResponse:
         except (TypeError, ValueError):
             return JSONResponse({"error": f"invalid book_id: {book_id_raw!r}"}, status_code=400)
 
+    weighting = body.get("weighting", request.query_params.get("weighting", "equal"))
+    if weighting not in ("equal", "gross"):
+        return JSONResponse({"error": f"invalid weighting: {weighting!r} (use 'equal' or 'gross')"}, status_code=400)
+
     job_id = uuid.uuid4().hex
     job = {
         "job_id": job_id,
         "status": "pending",
-        "request": {"date": date, "vt": vt, "book_id": book_id},
+        "request": {"date": date, "vt": vt, "book_id": book_id, "weighting": weighting},
         "result": None,
         "error": None,
         "created_at": _now_iso(),
@@ -700,7 +710,7 @@ async def submit_hedge_job(request: Request) -> JSONResponse:
     }
     _store_job(job)
 
-    task = asyncio.create_task(_process_hedge_job(job_id, date, vt, book_id))
+    task = asyncio.create_task(_process_hedge_job(job_id, date, vt, book_id, weighting))
     _HEDGE_BG_TASKS.add(task)
     task.add_done_callback(_HEDGE_BG_TASKS.discard)
 
