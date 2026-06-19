@@ -11,7 +11,11 @@ import numpy as np
 import pandas as pd
 
 from lib.mango import _constituents_from_positions
-from lib.portfolio_vol import portfolio_return_series, portfolio_realized_vol_asof
+from lib.portfolio_vol import (
+    portfolio_return_series,
+    portfolio_value_series,
+    portfolio_realized_vol_asof,
+)
 
 
 def _payload():
@@ -114,6 +118,31 @@ def _returns(cols, n=80, seed=1):
     idx = pd.bdate_range("2024-01-01", periods=n)
     return pd.DataFrame({c: rng.normal(0.0004, 0.012 + 0.004 * i, n)
                          for i, c in enumerate(cols)}, index=idx)
+
+
+def test_portfolio_value_series():
+    """NAV index = base * cumprod(1 + r_p); log-diff recovers the daily returns."""
+    df = _returns(["AAA", "BBB"])
+    w = {"AAA": 0.6, "BBB": 0.4}
+    r_p = portfolio_return_series(df, w)
+    nav = portfolio_value_series(df, w, base=100.0)
+    assert len(nav) == len(r_p)
+    assert abs(nav.iloc[0] - 100.0 * (1 + r_p.iloc[0])) < 1e-9
+    assert (nav - 100.0 * (1 + r_p).cumprod()).abs().max() < 1e-9
+    # log-diff of the value series == log1p of the portfolio return
+    lr = np.log(nav).diff().dropna()
+    assert (lr - np.log1p(r_p).iloc[1:]).abs().max() < 1e-12
+
+
+def test_value_series_vol_equals_log1p_formula():
+    """The NAV-based vol must equal the prior std(ln(1+r_p)) formula (no numeric
+    change from materializing the value series)."""
+    df = _returns(["AAA", "BBB", "CCC"], n=120, seed=4)
+    w = {"AAA": 0.5, "BBB": 0.3, "CCC": -0.2}
+    out = portfolio_realized_vol_asof(df, w, window=30)
+    r_p = portfolio_return_series(df, w)
+    prior = float(np.log1p(r_p).iloc[-30:].std(ddof=1) * np.sqrt(252))
+    assert abs(out["portfolio_vol"] - prior) < 1e-12
 
 
 def test_single_asset_matches_its_own_logvol():

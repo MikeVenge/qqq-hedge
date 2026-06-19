@@ -54,6 +54,22 @@ def portfolio_return_series(
     return sub.mul(wv, axis=1).sum(axis=1)
 
 
+def portfolio_value_series(
+    returns_df: pd.DataFrame,
+    weights,
+    base: float = 100.0,
+) -> pd.Series:
+    """Materialized daily portfolio value (NAV) index.
+
+    V(t) = base * prod_{s<=t} (1 + r_p(s))  where r_p is the (daily-rebalanced)
+    weighted simple return of the portfolio. Indexed by the aligned trading days.
+    Differencing log(V) recovers the portfolio's daily log returns:
+    ln(V_t / V_{t-1}) = ln(1 + r_p(t)).
+    """
+    r_p = portfolio_return_series(returns_df, weights)
+    return base * (1.0 + r_p).cumprod()
+
+
 def portfolio_realized_vol_asof(
     returns_df: pd.DataFrame,
     weights,
@@ -64,8 +80,13 @@ def portfolio_realized_vol_asof(
 ) -> dict:
     """Scalar trailing portfolio vol for the live single-date signal.
 
-    Rolls back to the most recent aligned trading day <= as_of and computes
-    sigma = std(ln(1+r_p)[last `window`], ddof=1) * sqrt(annualization).
+    Builds the explicit daily portfolio value (NAV) series, takes its log
+    returns, and annualizes the sample std of the last `window` returns:
+      V(t) = base * prod(1 + r_p)          (portfolio_value_series)
+      lr(t) = ln(V_t / V_{t-1})            (= ln(1 + r_p(t)))
+      sigma = std(lr[last window], ddof=1) * sqrt(annualization)
+    `window` daily returns require `window + 1` NAV points (31 values -> 30
+    returns). Rolls back to the most recent aligned trading day <= as_of.
 
     Returns {portfolio_vol, as_of_date, n_aligned_days, n_priced, missing,
     coverage, net_exposure} or {"error": ...}.
@@ -88,26 +109,35 @@ def portfolio_realized_vol_asof(
             "coverage": coverage,
         }
 
-    r_p = portfolio_return_series(returns_df, w.reindex(priced))
+    # 1) daily portfolio value (NAV) series
+    nav = portfolio_value_series(returns_df, w.reindex(priced))
     if as_of is not None:
-        r_p = r_p[r_p.index <= pd.Timestamp(as_of)]
-    if len(r_p) < window:
-        return {"error": f"insufficient history: {len(r_p)} aligned days < window {window}"}
+        nav = nav[nav.index <= pd.Timestamp(as_of)]
+    # need window+1 values to produce `window` log returns
+    if len(nav) < window + 1:
+        return {
+            "error": (
+                f"insufficient history: {len(nav)} aligned values "
+                f"< {window + 1} needed for {window} returns"
+            )
+        }
 
-    win = r_p.iloc[-window:]
-    g = np.log1p(win)
-    g = g[np.isfinite(g)]
-    if len(g) < max(2, int(window * 0.8)):
+    # 2) daily portfolio log returns from the value series
+    log_rets = np.log(nav).diff().dropna()
+    log_rets = log_rets[np.isfinite(log_rets)]
+    if len(log_rets) < window:
         return {"error": "too many non-finite portfolio returns (over-levered book?)"}
 
-    vol = float(g.std(ddof=1) * np.sqrt(annualization))
+    # 3) sample std of the last `window` returns, 4) annualized
+    win = log_rets.iloc[-window:]
+    vol = float(win.std(ddof=1) * np.sqrt(annualization))
     if not np.isfinite(vol) or vol <= 0:
         return {"error": "portfolio vol is non-finite or zero"}
 
     return {
         "portfolio_vol": vol,
-        "as_of_date": str(r_p.index[-1].date()),
-        "n_aligned_days": int(len(r_p)),
+        "as_of_date": str(nav.index[-1].date()),
+        "n_aligned_days": int(len(nav)),
         "window": int(window),
         "n_priced": len(priced),
         "missing": missing,
