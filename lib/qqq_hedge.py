@@ -377,6 +377,16 @@ class QQQVolTargetSignal:
 _REGIME_LABELS = {1.0: "risk-on", 0.5: "half", 0.0: "cash"}
 
 
+def auto_target_vol(portfolio_vol: float) -> float:
+    """Internally-computed VT for the book path: target_vol = 1 - portfolio_vol
+    (as fractions), floored at 0.
+
+    e.g. vol 0.40 -> 0.60 (VT60); vol 0.593 -> 0.407 (VT~40.7); vol >= 1.0 -> 0
+    (full cash). Paired with a 2.0x leverage cap in the book path.
+    """
+    return max(0.0, 1.0 - float(portfolio_vol))
+
+
 def hedge_parameters(
     close: pd.Series,
     returns: Optional[pd.Series] = None,
@@ -464,6 +474,9 @@ def hedge_parameters(
             out["n_constituents"] = book_meta.get("n_constituents")
             if book_meta.get("weighting"):
                 out["weighting"] = book_meta["weighting"]
+            if book_meta.get("vt_auto"):
+                out["vt_auto"] = True
+                out["leverage_cap"] = book_meta.get("leverage_cap")
             if book_meta.get("excluded_cash"):
                 out["excluded_cash"] = book_meta["excluded_cash"]
                 out["excluded_cash_weight"] = book_meta.get("excluded_cash_weight")

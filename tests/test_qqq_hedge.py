@@ -116,6 +116,41 @@ def test_hedge_parameters_reconciles():
     assert "portfolio_vol" not in p
 
 
+def test_auto_target_vol():
+    from lib.qqq_hedge import auto_target_vol
+    assert abs(auto_target_vol(0.40) - 0.60) < 1e-12    # vol 40% -> VT60
+    assert abs(auto_target_vol(0.593) - 0.407) < 1e-12  # book 132 -> VT~40.7
+    assert abs(auto_target_vol(0.0) - 1.0) < 1e-12
+    assert auto_target_vol(1.2) == 0.0                  # vol >= 100% -> full cash
+
+
+def test_auto_vt_book_path_math():
+    """Book auto-VT: target_vol = 1 - pv, 2.0x cap, w_vol = min((1-pv)/pv, 2.0)."""
+    from lib.qqq_hedge import VolTargetConfig, auto_target_vol
+    rng = np.random.default_rng(3)
+    dates = pd.bdate_range("2019-01-01", periods=600)
+    rets = pd.Series(rng.normal(0.0004, 0.013, 600), index=dates)
+    close = (1 + rets).cumprod() * 300
+
+    # pv = 0.30 -> target 0.70 -> w_vol = min(0.70/0.30, 2.0) = 2.0 (capped)
+    pv = 0.30
+    cfg = VolTargetConfig(target_vol=auto_target_vol(pv), leverage_cap=2.0)
+    p = hedge_parameters(close, rets, as_of=None, vt=auto_target_vol(pv) * 100, config=cfg,
+                         rv_override=pv, vol_source="portfolio",
+                         book_meta={"book_id": 1, "book_name": "B", "n_constituents": 5,
+                                    "vt_auto": True, "leverage_cap": 2.0})
+    assert abs(p["w_vol"] - 2.0) < 1e-9 and p["leverage_capped"] is True
+    assert p["vt_auto"] is True and p["leverage_cap"] == 2.0
+    assert abs(p["exposure"] - p["gate"] * 2.0) < 1e-9
+
+    # pv = 0.50 -> target 0.50 -> w_vol = 1.0 (fully invested at gate 1.0)
+    pv = 0.50
+    cfg = VolTargetConfig(target_vol=auto_target_vol(pv), leverage_cap=2.0)
+    p = hedge_parameters(close, rets, as_of=None, vt=50, config=cfg, rv_override=pv,
+                         vol_source="portfolio", book_meta={"vt_auto": True, "leverage_cap": 2.0})
+    assert abs(p["w_vol"] - 1.0) < 1e-9
+
+
 def test_rv_override_decouples_vol_from_gate():
     """rv_override replaces the vol input; the SMA gate must stay on QQQ."""
     rng = np.random.default_rng(3)

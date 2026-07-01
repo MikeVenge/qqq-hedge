@@ -286,7 +286,7 @@ def _compute_hedge_signal(
     regime gate still uses QQQ.
     """
     from lib.data import load_ohlcv_alphavantage
-    from lib.qqq_hedge import hedge_parameters
+    from lib.qqq_hedge import hedge_parameters, VolTargetConfig, auto_target_vol
 
     ohlcv = load_ohlcv_alphavantage(["QQQ"], start="2019-01-01")
     if ohlcv is None:
@@ -317,13 +317,19 @@ def _compute_hedge_signal(
     if "error" in volinfo:
         return {"error": f"book {book_id} vol: {volinfo['error']}"}
 
+    # Book path: VT is computed INTERNALLY (the user `vt` is ignored) as
+    # target_vol = 1 - portfolio_vol, with a 2.0x leverage cap.
+    pv = volinfo["portfolio_vol"]
+    target_vol = auto_target_vol(pv)                     # 1 - pv, floored at 0
+    cfg = VolTargetConfig(target_vol=max(1e-6, target_vol), leverage_cap=2.0)
     return hedge_parameters(
-        close, returns, as_of=date, vt=vt,
-        rv_override=volinfo["portfolio_vol"], vol_source="portfolio",
+        close, returns, as_of=date, vt=round(target_vol * 100, 4), config=cfg,
+        rv_override=pv, vol_source="portfolio",
         book_meta={
             "book_id": book["book_id"], "book_name": book["book_name"],
             "n_constituents": book["n_constituents"],
             "weighting": book.get("weighting"),
+            "vt_auto": True, "leverage_cap": 2.0,
             "excluded_cash": book.get("dropped_cash") or None,
             "excluded_cash_weight": book.get("cash_weight") or None,
         },
@@ -352,6 +358,8 @@ def qqq_hedge_signal(
         book_id: Optional Mango trading-book ID. When set, the inverse-vol scalar
             uses the book's 30-day realized portfolio volatility instead of QQQ's
             (the SMA regime gate still uses QQQ). Cash/T-bill holdings are excluded.
+            NOTE: when book_id is set, `vt` is IGNORED -- the target vol is computed
+            internally as (1 - portfolio_vol) with a 2.0x leverage cap.
         weighting: How constituents are weighted for the book vol: "equal"
             (default; each risk name 1/N) or "gross" (market-value weight_of_gross).
     """

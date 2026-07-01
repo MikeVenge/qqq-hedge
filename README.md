@@ -62,6 +62,9 @@ All fields are **optional**:
   scalar uses the book's **30-day realized portfolio volatility** instead of
   QQQ's; the SMA regime gate still uses QQQ. The response adds
   `vol_source:"portfolio"`, `portfolio_vol`, `book_name`, `n_constituents`.
+  **`vt` is ignored on the book path** — the target vol is computed internally
+  as `1 − portfolio_vol` (e.g. vol 40% → VT60) with a **2.0× leverage cap**;
+  the response reports `vt_auto:true` and `leverage_cap:2.0`.
   Cash / T-bill / money-market holdings (BIL, SGOV, SHV, …) are **excluded**
   from the vol basket and the risk weights renormalized — otherwise a cash slug
   would deflate the vol and over-deploy the hedge; any excluded names are
