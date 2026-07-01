@@ -53,11 +53,18 @@ _CASH_EQUIVALENTS = frozenset({
     "CASH", "USD",
 })
 
+# Non-cash holdings also excluded from the risk basket: sector-hedge / defensive
+# overlays that shouldn't drive the portfolio-vol target. Reported under the same
+# `excluded_cash` field as the cash equivalents above.
+_EXCLUDED_HEDGES = frozenset({"XLU", "XLV"})
+
 
 def _cash_tickers() -> frozenset:
+    """Tickers excluded from the risk basket (cash equivalents + hedge overlays).
+    Extend at runtime via env CASH_TICKERS (comma-separated)."""
     extra = os.environ.get("CASH_TICKERS", "")
     extras = {t.strip().upper() for t in extra.split(",") if t.strip()}
-    return _CASH_EQUIVALENTS | extras
+    return _CASH_EQUIVALENTS | _EXCLUDED_HEDGES | extras
 
 
 def _parse_rpc(raw: str) -> dict:

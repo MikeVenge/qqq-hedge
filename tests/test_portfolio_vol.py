@@ -102,6 +102,23 @@ def test_constituents_drops_cash():
     assert "BIL" in r2["symbols"]
 
 
+def test_constituents_drops_hedge_overlays():
+    """Sector-hedge ETFs XLU / XLV are excluded like cash (into excluded_cash)."""
+    payload = {"positions": [
+        {"symbol": "AAA", "quantity": 1, "market_value": "500",
+         "weight_of_gross": "50", "asset_class": "equity", "long_short": "L"},
+        {"symbol": "XLU", "quantity": 1, "market_value": "300",
+         "weight_of_gross": "30", "asset_class": "equity", "long_short": "L"},
+        {"symbol": "XLV", "quantity": 1, "market_value": "200",
+         "weight_of_gross": "20", "asset_class": "equity", "long_short": "L"},
+    ]}
+    r = _constituents_from_positions(payload, book_id=137, weighting="gross")
+    assert r["symbols"] == ["AAA"]                       # only the true risk name
+    assert set(r["dropped_cash"]) == {"XLU", "XLV"}
+    assert abs(r["cash_weight"] - 0.50) < 1e-9          # 30% + 20% of gross
+    assert abs(r["weights"]["AAA"] - 1.0) < 1e-9        # renormalized to 100%
+
+
 def test_constituents_market_value_fallback():
     # No weight_of_gross -> derive from |market_value|
     payload = {"positions": [

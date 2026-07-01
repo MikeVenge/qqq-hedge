@@ -65,10 +65,10 @@ All fields are **optional**:
   **`vt` is ignored on the book path** — the target vol is computed internally
   as `1 − portfolio_vol` (e.g. vol 40% → VT60) with a **2.0× leverage cap**;
   the response reports `vt_auto:true` and `leverage_cap:2.0`.
-  Cash / T-bill / money-market holdings (BIL, SGOV, SHV, …) are **excluded**
-  from the vol basket and the risk weights renormalized — otherwise a cash slug
-  would deflate the vol and over-deploy the hedge; any excluded names are
-  reported as `excluded_cash` / `excluded_cash_weight`. (Slower: the server
+  Cash / T-bill / money-market holdings (BIL, SGOV, SHV, …) plus sector-hedge
+  overlays (XLU, XLV) are **excluded** from the vol basket and the risk weights
+  renormalized — otherwise a cash/hedge slug would distort the vol; any excluded
+  names are reported as `excluded_cash` / `excluded_cash_weight`. (Slower: the server
   fetches each constituent's prices — use the async poll.)
 - `weighting` — how book constituents are weighted for the vol: `"equal"`
   (default; each risk name 1/N) or `"gross"` (market-value `weight_of_gross`).
