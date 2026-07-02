@@ -125,30 +125,32 @@ def test_auto_target_vol():
 
 
 def test_auto_vt_book_path_math():
-    """Book auto-VT: target_vol = 1 - pv, 2.0x cap, w_vol = min((1-pv)/pv, 2.0)."""
+    """Book auto-VT with NO leverage: target_vol = 1 - pv, 1.0x cap,
+    w_vol = min((1-pv)/pv, 1.0) -> exposure never exceeds 100%."""
     from lib.qqq_hedge import VolTargetConfig, auto_target_vol
     rng = np.random.default_rng(3)
     dates = pd.bdate_range("2019-01-01", periods=600)
     rets = pd.Series(rng.normal(0.0004, 0.013, 600), index=dates)
     close = (1 + rets).cumprod() * 300
 
-    # pv = 0.30 -> target 0.70 -> w_vol = min(0.70/0.30, 2.0) = 2.0 (capped)
+    # pv = 0.30 (low vol) -> raw 0.70/0.30 = 2.33 -> capped at 1.0 (fully invested)
     pv = 0.30
-    cfg = VolTargetConfig(target_vol=auto_target_vol(pv), leverage_cap=2.0)
+    cfg = VolTargetConfig(target_vol=auto_target_vol(pv), leverage_cap=1.0)
     p = hedge_parameters(close, rets, as_of=None, vt=auto_target_vol(pv) * 100, config=cfg,
                          rv_override=pv, vol_source="portfolio",
                          book_meta={"book_id": 1, "book_name": "B", "n_constituents": 5,
-                                    "vt_auto": True, "leverage_cap": 2.0})
-    assert abs(p["w_vol"] - 2.0) < 1e-9 and p["leverage_capped"] is True
-    assert p["vt_auto"] is True and p["leverage_cap"] == 2.0
-    assert abs(p["exposure"] - p["gate"] * 2.0) < 1e-9
+                                    "vt_auto": True, "leverage_cap": 1.0})
+    assert abs(p["w_vol"] - 1.0) < 1e-9 and p["leverage_capped"] is True
+    assert p["vt_auto"] is True and p["leverage_cap"] == 1.0
+    assert p["cash"] >= -1e-9                              # no leverage -> cash never negative
+    assert abs(p["exposure"] - p["gate"] * 1.0) < 1e-9
 
-    # pv = 0.50 -> target 0.50 -> w_vol = 1.0 (fully invested at gate 1.0)
-    pv = 0.50
-    cfg = VolTargetConfig(target_vol=auto_target_vol(pv), leverage_cap=2.0)
-    p = hedge_parameters(close, rets, as_of=None, vt=50, config=cfg, rv_override=pv,
-                         vol_source="portfolio", book_meta={"vt_auto": True, "leverage_cap": 2.0})
-    assert abs(p["w_vol"] - 1.0) < 1e-9
+    # pv = 0.60 (higher vol) -> target 0.40 -> w_vol = min(0.40/0.60, 1.0) = 0.667
+    pv = 0.60
+    cfg = VolTargetConfig(target_vol=auto_target_vol(pv), leverage_cap=1.0)
+    p = hedge_parameters(close, rets, as_of=None, vt=40, config=cfg, rv_override=pv,
+                         vol_source="portfolio", book_meta={"vt_auto": True, "leverage_cap": 1.0})
+    assert abs(p["w_vol"] - round(0.40 / 0.60, 4)) < 1e-9 and p["leverage_capped"] is False
 
 
 def test_rv_override_decouples_vol_from_gate():
