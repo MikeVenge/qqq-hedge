@@ -318,8 +318,8 @@ def _compute_hedge_signal(
         return {"error": f"book {book_id} vol: {volinfo['error']}"}
 
     # Book path: VT is computed INTERNALLY (the user `vt` is ignored) as
-    # target_vol = 1 - portfolio_vol, capped at 1.0x (no leverage -> max 100%).
-    BOOK_LEVERAGE_CAP = 1.0
+    # target_vol = 1 - portfolio_vol, with a 1.5x leverage cap.
+    BOOK_LEVERAGE_CAP = 1.5
     pv = volinfo["portfolio_vol"]
     target_vol = auto_target_vol(pv)                     # 1 - pv, floored at 0
     cfg = VolTargetConfig(target_vol=max(1e-6, target_vol), leverage_cap=BOOK_LEVERAGE_CAP)
@@ -360,8 +360,7 @@ def qqq_hedge_signal(
             uses the book's 30-day realized portfolio volatility instead of QQQ's
             (the SMA regime gate still uses QQQ). Cash/T-bill holdings are excluded.
             NOTE: when book_id is set, `vt` is IGNORED -- the target vol is computed
-            internally as (1 - portfolio_vol), capped at 1.0x (no leverage; max
-            100% invested).
+            internally as (1 - portfolio_vol), with a 1.5x leverage cap.
         weighting: How constituents are weighted for the book vol: "equal"
             (default; each risk name 1/N) or "gross" (market-value weight_of_gross).
     """

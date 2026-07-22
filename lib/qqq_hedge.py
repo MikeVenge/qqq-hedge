@@ -382,8 +382,7 @@ def auto_target_vol(portfolio_vol: float) -> float:
     (as fractions), floored at 0.
 
     e.g. vol 0.40 -> 0.60 (VT60); vol 0.593 -> 0.407 (VT~40.7); vol >= 1.0 -> 0
-    (full cash). Paired with a 1.0x cap in the book path (no leverage -> max
-    100% invested; a book with vol < 50% just pins to fully invested).
+    (full cash). Paired with a 1.5x leverage cap in the book path.
     """
     return max(0.0, 1.0 - float(portfolio_vol))
 
