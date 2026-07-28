@@ -408,7 +408,9 @@ def hedge_parameters(
         rv_override: if set, replaces QQQ's rv20 in w_vol (book portfolio vol).
                      The SMA gate still uses QQQ `close`.
         vol_source: "qqq" (default) or "portfolio"; labels the output.
-        book_meta: optional {book_id, book_name, n_constituents} for the output.
+        book_meta: optional basket metadata for the output ({book_id, book_name}
+                   for a Mango book, or {tickers} for an ad-hoc list, plus
+                   n_constituents / weighting / vt_auto / leverage_cap / ...).
 
     Returns a dict of hedging parameters, or {"error": ...} on failure.
     """
@@ -469,8 +471,11 @@ def hedge_parameters(
         out["portfolio_vol"] = round(float(row["rv20"]), 4)
         out["portfolio_vol_pct"] = f"{float(row['rv20']) * 100:.1f}%"
         if book_meta:
-            out["book_id"] = book_meta.get("book_id")
-            out["book_name"] = book_meta.get("book_name")
+            if book_meta.get("book_id") is not None:
+                out["book_id"] = book_meta.get("book_id")
+                out["book_name"] = book_meta.get("book_name")
+            if book_meta.get("tickers"):
+                out["tickers"] = book_meta["tickers"]
             out["n_constituents"] = book_meta.get("n_constituents")
             if book_meta.get("weighting"):
                 out["weighting"] = book_meta["weighting"]

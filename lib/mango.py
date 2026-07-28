@@ -248,6 +248,85 @@ def _constituents_from_positions(
     }
 
 
+def constituents_from_tickers(
+    tickers,
+    *,
+    include_cash: bool = False,
+    max_constituents: int | None = None,
+) -> dict:
+    """Pure: turn a user-supplied ticker list into signed equal weights.
+
+    Same output contract as `_constituents_from_positions`, so the hedge
+    signal's portfolio-vol path can consume either source. No Mango I/O.
+
+    - accepts a list of symbols or one comma/space-separated string
+    - a "-" prefix marks a short (e.g. "-IWM" -> weight -1/N); default long
+    - duplicates collapse; the same symbol both long and short is an error
+    - cash/T-bill/MMF + hedge-overlay tickers (see _cash_tickers) are dropped
+      unless include_cash, reported via dropped_cash; cash_weight is their
+      would-have-been equal-weight share
+    - equal weighting only (an ad-hoc list has no market values): +/- 1/N
+    - more than `max_constituents` names is an error (no silent truncation --
+      the caller typed the list)
+    """
+    if max_constituents is None:
+        max_constituents = _max_constituents()
+    if isinstance(tickers, str):
+        tickers = [t for t in tickers.replace(",", " ").split() if t]
+
+    signs: dict[str, int] = {}
+    order: list[str] = []
+    for raw in tickers or []:
+        t = str(raw).strip().upper()
+        sign = 1
+        if t.startswith("-"):
+            sign, t = -1, t[1:].strip()
+        if not t:
+            continue
+        if not all(c.isalnum() or c in ".-" for c in t):
+            return {"error": f"invalid ticker: {raw!r}"}
+        prev = signs.get(t)
+        if prev is not None and prev != sign:
+            return {"error": f"ticker {t} appears both long and short"}
+        if prev is None:
+            order.append(t)
+        signs[t] = sign
+
+    if not signs:
+        return {"error": "no tickers provided"}
+    if len(signs) > max_constituents:
+        return {"error": f"{len(signs)} tickers exceeds the max of {max_constituents}"}
+
+    cash_set = _cash_tickers()
+    dropped_cash = [t for t in order if not include_cash and t in cash_set]
+    risk = [t for t in order if t not in dropped_cash]
+    if not risk:
+        return {
+            "error": (
+                f"no risk tickers after excluding cash/hedge overlays "
+                f"{sorted(dropped_cash)}"
+            )
+        }
+
+    n = len(risk)
+    weights = {t: signs[t] * (1.0 / n) for t in risk}
+    return {
+        "book_id": None,
+        "book_name": None,
+        "tickers": [("-" + t) if signs[t] < 0 else t for t in risk],
+        "symbols": sorted(weights.keys()),
+        "weights": weights,
+        "weighting": "equal",
+        "n_constituents": n,
+        "n_dropped_options": 0,
+        "n_dropped_cash": len(dropped_cash),
+        "dropped_cash": sorted(dropped_cash),
+        "cash_weight": round(len(dropped_cash) / (n + len(dropped_cash)), 4),
+        "n_truncated": 0,
+        "net_exposure": round(sum(weights.values()), 6),
+    }
+
+
 def resolve_book_constituents(
     book_id: int,
     *,

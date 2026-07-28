@@ -269,24 +269,34 @@ def gate_factor(
 # ===========================================================================
 
 
+# Portfolio paths (Mango book OR ad-hoc ticker list): VT is computed INTERNALLY
+# as target_vol = 1 - portfolio_vol, with this leverage cap on w_vol.
+PORTFOLIO_LEVERAGE_CAP = 1.5
+
+
 def _compute_hedge_signal(
     date: str | None = None,
     vt: float = 15,
     book_id: int | None = None,
     weighting: str = "equal",
+    tickers: list[str] | None = None,
 ) -> dict:
-    """Shared core for the QQQ hedge signal (used by the MCP tool and REST API).
+    """Shared core for the QQQ hedge signal (used by the MCP tools and REST API).
 
     Blocking (Alpha Vantage fetch + pandas + optional Mango call); call via a
     threadpool from async contexts. Returns the hedging-parameters dict, or
     {"error": ...}.
 
-    When `book_id` is set, the inverse-vol scalar uses the 30-day realized
-    volatility of that Mango book's current portfolio instead of QQQ's; the SMA
-    regime gate still uses QQQ.
+    When `book_id` (Mango book) or `tickers` (ad-hoc equal-weight basket) is
+    set, the inverse-vol scalar uses that portfolio's 30-day realized
+    volatility instead of QQQ's; the SMA regime gate still uses QQQ, and the
+    user `vt` is IGNORED (target_vol = 1 - portfolio_vol, 1.5x leverage cap).
     """
     from lib.data import load_ohlcv_alphavantage
     from lib.qqq_hedge import hedge_parameters, VolTargetConfig, auto_target_vol
+
+    if book_id is not None and tickers:
+        return {"error": "pass either book_id or tickers, not both"}
 
     ohlcv = load_ohlcv_alphavantage(["QQQ"], start="2019-01-01")
     if ohlcv is None:
@@ -294,45 +304,49 @@ def _compute_hedge_signal(
     close = ohlcv["close"]["QQQ"]
     returns = ohlcv["returns"]["QQQ"]
 
-    if book_id is None:
+    if book_id is None and not tickers:
         return hedge_parameters(close, returns, as_of=date, vt=vt)
 
-    # --- Book portfolio-vol path ---
-    from lib.mango import resolve_book_constituents
+    # --- Portfolio-vol path (Mango book or ticker list) ---
     from lib.portfolio_vol import portfolio_realized_vol_asof
 
-    book = resolve_book_constituents(int(book_id), weighting=weighting)
-    if "error" in book:
-        return {"error": f"book {book_id}: {book['error']}"}
-    if not book["symbols"]:
-        return {"error": f"book {book_id}: no priced constituents"}
+    if book_id is not None:
+        from lib.mango import resolve_book_constituents
+        label = f"book {book_id}"
+        basket = resolve_book_constituents(int(book_id), weighting=weighting)
+    else:
+        from lib.mango import constituents_from_tickers
+        label = "tickers"
+        basket = constituents_from_tickers(tickers)
+    if "error" in basket:
+        return {"error": f"{label}: {basket['error']}"}
+    if not basket["symbols"]:
+        return {"error": f"{label}: no priced constituents"}
 
-    panel = load_ohlcv_alphavantage(book["symbols"], start="2019-01-01")
+    panel = load_ohlcv_alphavantage(basket["symbols"], start="2019-01-01")
     if panel is None:
-        return {"error": "Could not load book constituent prices from Alpha Vantage"}
+        return {"error": f"Could not load {label} constituent prices from Alpha Vantage"}
 
     volinfo = portfolio_realized_vol_asof(
-        panel["returns"], book["weights"], as_of=date, window=30
+        panel["returns"], basket["weights"], as_of=date, window=30
     )
     if "error" in volinfo:
-        return {"error": f"book {book_id} vol: {volinfo['error']}"}
+        return {"error": f"{label} vol: {volinfo['error']}"}
 
-    # Book path: VT is computed INTERNALLY (the user `vt` is ignored) as
-    # target_vol = 1 - portfolio_vol, with a 1.5x leverage cap.
-    BOOK_LEVERAGE_CAP = 1.5
     pv = volinfo["portfolio_vol"]
     target_vol = auto_target_vol(pv)                     # 1 - pv, floored at 0
-    cfg = VolTargetConfig(target_vol=max(1e-6, target_vol), leverage_cap=BOOK_LEVERAGE_CAP)
+    cfg = VolTargetConfig(target_vol=max(1e-6, target_vol), leverage_cap=PORTFOLIO_LEVERAGE_CAP)
     return hedge_parameters(
         close, returns, as_of=date, vt=round(target_vol * 100, 4), config=cfg,
         rv_override=pv, vol_source="portfolio",
         book_meta={
-            "book_id": book["book_id"], "book_name": book["book_name"],
-            "n_constituents": book["n_constituents"],
-            "weighting": book.get("weighting"),
-            "vt_auto": True, "leverage_cap": BOOK_LEVERAGE_CAP,
-            "excluded_cash": book.get("dropped_cash") or None,
-            "excluded_cash_weight": book.get("cash_weight") or None,
+            "book_id": basket.get("book_id"), "book_name": basket.get("book_name"),
+            "tickers": basket.get("tickers"),
+            "n_constituents": basket["n_constituents"],
+            "weighting": basket.get("weighting"),
+            "vt_auto": True, "leverage_cap": PORTFOLIO_LEVERAGE_CAP,
+            "excluded_cash": basket.get("dropped_cash") or None,
+            "excluded_cash_weight": basket.get("cash_weight") or None,
         },
     )
 
@@ -368,6 +382,37 @@ def qqq_hedge_signal(
         return _compute_hedge_signal(date, vt, book_id, weighting)
     except Exception as e:
         logger.error(f"qqq_hedge_signal failed: {traceback.format_exc()}")
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def qqq_hedge_signal_tickers(
+    tickers: list[str],
+    date: str | None = None,
+) -> dict:
+    """QQQ hedge signal for an ad-hoc basket of tickers (no Mango book needed).
+
+    Same two-layer overlay as `qqq_hedge_signal` with a book_id, but the
+    portfolio is the given ticker list, equal-weighted (each name +/- 1/N):
+    the inverse-vol scalar uses the basket's 30-day realized portfolio
+    volatility, the SMA regime gate still uses QQQ, and the target vol is
+    computed internally as (1 - portfolio_vol) with a 1.5x leverage cap.
+
+    Args:
+        tickers: Ticker symbols, e.g. ["NVDA", "MSFT", "AVGO"]. Prefix with "-"
+            for a short leg (e.g. "-IWM"). Cash/T-bill ETFs and hedge overlays
+            (BIL, SGOV, XLU, XLV, ...) are excluded from the vol basket
+            automatically and reported under `excluded_cash`.
+        date: As-of date (ISO, e.g. "2026-05-28"); rolls back to the most
+            recent trading day on/before it. Omit for the latest trading day.
+    """
+    try:
+        cleaned = [t for t in (str(s).strip() for s in (tickers or [])) if t]
+        if not cleaned:
+            return {"error": "tickers list is empty"}
+        return _compute_hedge_signal(date=date, tickers=cleaned)
+    except Exception as e:
+        logger.error(f"qqq_hedge_signal_tickers failed: {traceback.format_exc()}")
         return {"error": str(e)}
 
 
@@ -626,7 +671,9 @@ async def health(request: Request) -> JSONResponse:
 # ===========================================================================
 #
 #   POST /api/hedge            -> 202 { job_id, status: "pending", poll_url }
-#       body or query: { "date": "2026-05-28"(optional), "vt": 23(optional, def 15) }
+#       body or query: { "date": "2026-05-28"(optional), "vt": 23(optional, def 15),
+#                        "book_id": 132(optional) OR "tickers": ["NVDA","MSFT"](optional),
+#                        "weighting": "equal"|"gross"(optional, book only) }
 #   GET  /api/hedge/{job_id}   -> 202 while pending/running; 200 when done/error
 #       done  -> { status: "done",  result: {...hedging params...} }
 #       error -> { status: "error", error: "..." }
@@ -652,6 +699,7 @@ def _store_job(job: dict) -> None:
 async def _process_hedge_job(
     job_id: str, date: str | None, vt: float,
     book_id: int | None = None, weighting: str = "equal",
+    tickers: list[str] | None = None,
 ) -> None:
     job = _HEDGE_JOBS.get(job_id)
     if job is None:
@@ -659,7 +707,9 @@ async def _process_hedge_job(
     job["status"] = "running"
     try:
         # Offload the blocking fetch + compute so the event loop stays free.
-        result = await asyncio.to_thread(_compute_hedge_signal, date, vt, book_id, weighting)
+        result = await asyncio.to_thread(
+            _compute_hedge_signal, date, vt, book_id, weighting, tickers
+        )
         if isinstance(result, dict) and "error" in result:
             job["status"] = "error"
             job["error"] = result["error"]
@@ -707,11 +757,29 @@ async def submit_hedge_job(request: Request) -> JSONResponse:
     if weighting not in ("equal", "gross"):
         return JSONResponse({"error": f"invalid weighting: {weighting!r} (use 'equal' or 'gross')"}, status_code=400)
 
+    # tickers: JSON list in the body, or comma-separated string (body or query)
+    tickers_raw = body.get("tickers", request.query_params.get("tickers"))
+    tickers = None
+    if tickers_raw is not None and tickers_raw != "":
+        if isinstance(tickers_raw, str):
+            tickers = [t.strip() for t in tickers_raw.split(",") if t.strip()]
+        elif isinstance(tickers_raw, list) and all(isinstance(t, str) for t in tickers_raw):
+            tickers = [t for t in (s.strip() for s in tickers_raw) if t]
+        else:
+            return JSONResponse(
+                {"error": f"invalid tickers: {tickers_raw!r} (use a JSON list of symbols or a comma-separated string)"},
+                status_code=400,
+            )
+        if not tickers:
+            return JSONResponse({"error": "tickers list is empty"}, status_code=400)
+    if book_id is not None and tickers:
+        return JSONResponse({"error": "pass either book_id or tickers, not both"}, status_code=400)
+
     job_id = uuid.uuid4().hex
     job = {
         "job_id": job_id,
         "status": "pending",
-        "request": {"date": date, "vt": vt, "book_id": book_id, "weighting": weighting},
+        "request": {"date": date, "vt": vt, "book_id": book_id, "weighting": weighting, "tickers": tickers},
         "result": None,
         "error": None,
         "created_at": _now_iso(),
@@ -719,7 +787,7 @@ async def submit_hedge_job(request: Request) -> JSONResponse:
     }
     _store_job(job)
 
-    task = asyncio.create_task(_process_hedge_job(job_id, date, vt, book_id, weighting))
+    task = asyncio.create_task(_process_hedge_job(job_id, date, vt, book_id, weighting, tickers))
     _HEDGE_BG_TASKS.add(task)
     task.add_done_callback(_HEDGE_BG_TASKS.discard)
 

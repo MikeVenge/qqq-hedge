@@ -73,8 +73,17 @@ All fields are **optional**:
 - `weighting` — how book constituents are weighted for the vol: `"equal"`
   (default; each risk name 1/N) or `"gross"` (market-value `weight_of_gross`).
   Reported back as `weighting` in the result.
+- `tickers` — an **ad-hoc basket** instead of a Mango book (mutually exclusive
+  with `book_id`): a JSON list (`["NVDA","MSFT","AVGO"]`) or comma-separated
+  string (`"NVDA,MSFT,AVGO"`). Behaves exactly like the book path — 30-day
+  portfolio vol, auto-VT (`1 − portfolio_vol`), 1.5× cap, QQQ gate — but the
+  basket is always **equal-weighted** (±1/N; no market values exist for a
+  list). Prefix a symbol with `-` for a short leg (e.g. `"-IWM"`). The same
+  cash/hedge exclusions apply (BIL, SGOV, XLU, XLV, …). The response echoes
+  the basket under `tickers` and has no `book_id`/`book_name`.
 
-You may also pass them as query params: `POST /api/hedge?date=2026-05-28&vt=23&book_id=31`.
+You may also pass them as query params: `POST /api/hedge?date=2026-05-28&vt=23&book_id=31`
+(or `...&tickers=NVDA,MSFT,AVGO`).
 
 **Response — `202 Accepted`:**
 
@@ -231,6 +240,14 @@ print(get_hedge(date="2026-05-28", vt=23))   # latest if date=None
 Same inputs and same `result` object as the REST API (returned synchronously,
 not as a job). With `book_id`, the vol input becomes the Mango book's 30-day
 portfolio volatility (gate stays on QQQ).
+
+**`qqq_hedge_signal_tickers(tickers: list[str], date: str | None = None) -> dict`**
+The portfolio-vol signal for an **ad-hoc ticker basket** — no Mango book
+needed. Equal-weights the list (±1/N; `-` prefix = short leg), computes the
+basket's 30-day realized portfolio vol, then applies the same internal auto-VT
+(`1 − portfolio_vol`, 1.5× leverage cap) and QQQ SMA gate as the book path.
+Cash/hedge-overlay tickers (BIL, SGOV, XLU, XLV, …) are excluded automatically.
+Example: `qqq_hedge_signal_tickers(tickers=["NVDA","MSFT","AVGO"], date="2026-07-25")`.
 
 **`qqq_hedge_backtest(start="2020-01-01", end="2026-12-31", vt=15, leverage_cap=1.5, fed_funds_rate=0.0) -> dict`**
 Backtests the overlay vs buy-and-hold. Returns `stats` (Sharpe, max drawdown,

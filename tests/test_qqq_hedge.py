@@ -152,6 +152,27 @@ def test_auto_vt_book_path_math():
     assert abs(p["w_vol"] - round(0.40 / 0.60, 4)) < 1e-9 and p["leverage_capped"] is False
 
 
+def test_tickers_meta_passthrough():
+    """An ad-hoc tickers basket surfaces `tickers` in the output and omits the
+    book_id/book_name keys entirely (it has no Mango book)."""
+    rng = np.random.default_rng(3)
+    dates = pd.bdate_range("2019-01-01", periods=600)
+    rets = pd.Series(rng.normal(0.0004, 0.013, 600), index=dates)
+    close = (1 + rets).cumprod() * 300
+
+    p = hedge_parameters(close, rets, as_of=None, vt=60, rv_override=0.40,
+                         vol_source="portfolio",
+                         book_meta={"book_id": None, "book_name": None,
+                                    "tickers": ["NVDA", "MSFT", "-IWM"],
+                                    "n_constituents": 3, "weighting": "equal",
+                                    "vt_auto": True, "leverage_cap": 1.5})
+    assert p["tickers"] == ["NVDA", "MSFT", "-IWM"]
+    assert "book_id" not in p and "book_name" not in p
+    assert p["n_constituents"] == 3 and p["weighting"] == "equal"
+    assert p["vt_auto"] is True and p["leverage_cap"] == 1.5
+    assert p["vol_source"] == "portfolio" and abs(p["portfolio_vol"] - 0.40) < 1e-9
+
+
 def test_rv_override_decouples_vol_from_gate():
     """rv_override replaces the vol input; the SMA gate must stay on QQQ."""
     rng = np.random.default_rng(3)

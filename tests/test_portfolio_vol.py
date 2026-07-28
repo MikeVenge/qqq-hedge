@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import numpy as np
 import pandas as pd
 
-from lib.mango import _constituents_from_positions
+from lib.mango import _constituents_from_positions, constituents_from_tickers
 from lib.portfolio_vol import (
     portfolio_return_series,
     portfolio_value_series,
@@ -128,6 +128,51 @@ def test_constituents_market_value_fallback():
     r = _constituents_from_positions(payload, book_id=2, weighting="gross")
     assert abs(r["weights"]["AAA"] - 0.75) < 1e-9
     assert abs(r["weights"]["BBB"] - 0.25) < 1e-9
+
+
+def test_tickers_equal_weights():
+    """A plain ticker list -> each name 1/N long; same output contract as books."""
+    r = constituents_from_tickers(["nvda", "MSFT", " avgo "])
+    assert "error" not in r, r
+    assert r["symbols"] == ["AVGO", "MSFT", "NVDA"]
+    assert r["tickers"] == ["NVDA", "MSFT", "AVGO"]      # input order preserved
+    assert r["weighting"] == "equal" and r["n_constituents"] == 3
+    assert all(abs(w - 1 / 3) < 1e-12 for w in r["weights"].values())
+    assert r["book_id"] is None
+    assert abs(r["net_exposure"] - 1.0) < 1e-9
+
+
+def test_tickers_short_prefix_and_string_input():
+    """'-' prefix marks a short leg; a comma-separated string also parses."""
+    r = constituents_from_tickers(["NVDA", "-IWM"])
+    assert abs(r["weights"]["NVDA"] - 0.5) < 1e-12
+    assert abs(r["weights"]["IWM"] - (-0.5)) < 1e-12
+    assert r["tickers"] == ["NVDA", "-IWM"]
+    assert abs(r["net_exposure"]) < 1e-9
+    s = constituents_from_tickers("NVDA, MSFT,AVGO")
+    assert s["symbols"] == ["AVGO", "MSFT", "NVDA"]
+
+
+def test_tickers_drops_cash_and_hedges():
+    """BIL/XLU/etc are excluded from the vol basket, weights renormalized 1/N."""
+    r = constituents_from_tickers(["NVDA", "BIL", "XLU", "MSFT"])
+    assert r["symbols"] == ["MSFT", "NVDA"]
+    assert r["dropped_cash"] == ["BIL", "XLU"]
+    assert abs(r["cash_weight"] - 0.5) < 1e-9            # 2 of 4 names
+    assert all(abs(w - 0.5) < 1e-12 for w in r["weights"].values())
+
+
+def test_tickers_dupes_conflicts_and_errors():
+    # duplicates collapse to one name
+    r = constituents_from_tickers(["NVDA", "nvda", "MSFT"])
+    assert r["n_constituents"] == 2
+    # same symbol long AND short is ambiguous -> error
+    assert "error" in constituents_from_tickers(["NVDA", "-NVDA"])
+    # empty / all-cash / oversized lists -> error, never silent truncation
+    assert "error" in constituents_from_tickers([])
+    assert "error" in constituents_from_tickers(["BIL", "SGOV"])
+    assert "error" in constituents_from_tickers(["A", "B", "C"], max_constituents=2)
+    assert "error" in constituents_from_tickers(["NV DA$"])
 
 
 def _returns(cols, n=80, seed=1):
